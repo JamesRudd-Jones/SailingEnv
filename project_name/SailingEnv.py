@@ -6,18 +6,15 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import chex
 from typing import Dict, Tuple, Any, Union, Optional
-import time
-import pygame
-from pygame import gfxdraw
 
 
 @struct.dataclass
 class EnvState(base_env.EnvState):
     boat_pos: jnp.ndarray
     boat_dir: jnp.ndarray
-    boat_dir_acc: jnp.ndarray
+    boat_angular_acc: jnp.ndarray
+    boat_angular_vel: jnp.ndarray
     boat_vel: jnp.ndarray
-    boat_path: jnp.ndarray
     time: int
 
 
@@ -28,26 +25,28 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
     def __init__(self, **env_kwargs):
         super().__init__(**env_kwargs)
 
-        self.dt: float = 1.0
+        self.dt: float = 0.1
 
         self.max_steps_in_episode: int = 500
         self.wind_dir: float = 0.0
-        self.wind_vel: jnp.ndarray = jnp.array((0.0, -50.0)) * self.dt
-        self.max_action: float = 0.001
-        self.max_heading_vel: float = 300.0 / 360.0 * 2 * jnp.pi * self.dt
-        self.max_speed: float = 10.0
-        self.acceleration: float = 1.0
-        self.deceleration: float = 2.0
+        self.wind_vel: jnp.ndarray = jnp.array((0.0, -7.0)) # in ms^-1
+        self.max_action: float = 1.0
+        self.max_speed: float = 5.0  # Max boat speed in ms^-1
+        self.max_angular_vel: float = jnp.pi / 2.0  # Max angular velocity (rad/s), roughly 90 deg/s
+        self.max_angular_acc: float = jnp.pi  # Max angular acceleration (rad/s^2), roughly 180 deg/s^2
+        self.max_speed: float = 3.0  # in ms^-1
+        self.acceleration: float = 10.0  # in ms^-2
+        self.deceleration: float = 20.0  # in ms^-2
+        # TODO adjust the accels above
 
-        self.mass: float = 3000.0
+        self.mass: float = 120.0  # in kg
 
-        self.screen_width: int = 800
-        self.screen_height: int = 600
-        # boat_path_length: int = 30
+        self.screen_width: int = 100 # in m
+        self.screen_height: int = 100 # in m
 
-        self.marks: jnp.ndarray = jnp.array(((400, 500),))
+        self.marks: jnp.ndarray = jnp.array(((self.screen_width/2, 80),))
         # TODO to deal with multiple marks, could jnp.roll once done a conditional
-        self.reward_gate: jnp.ndarray = jnp.array((10, 10))
+        # self.reward_gate: jnp.ndarray = jnp.array((10, 10))
 
     def step_env(self,
                  input_action: Union[jnp.int_, jnp.float_, chex.Array],
@@ -56,58 +55,87 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                  ) -> Tuple[chex.Array, chex.Array, EnvState, chex.Array, chex.Array, Dict[Any, Any]]:
         # 1. Update boat heading based on action
         action = self.action_convert(input_action)
-        speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_dir))
-        sqrtspeed = jax.lax.select(speed > 0,
-                                   jnp.sqrt(jnp.linalg.norm(state.boat_vel)),
-                                   -jnp.sqrt(jnp.linalg.norm(state.boat_vel)))
-        new_boat_dir_acc = state.boat_dir_acc * 0.97  # TODO some decel modifier, maybe better way to state it
-        new_boat_dir_acc = jnp.clip(new_boat_dir_acc + action.squeeze() * sqrtspeed,
-                                      -self.max_heading_vel,
-                                      self.max_heading_vel)
-        new_heading = state.boat_dir + new_boat_dir_acc
+
+        RUDDER_MAX_FORCE_COEFF: float = 50.0
+
+        rudder_force_magnitude = action * RUDDER_MAX_FORCE_COEFF * (jnp.linalg.norm(state.boat_vel) ** 2)
+        angular_acc = rudder_force_magnitude / self.mass
+        angular_acc = jnp.clip(angular_acc,
+                               -self.max_angular_vel,
+                               self.max_angular_vel)
+
+        angular_vel = state.boat_angular_vel + angular_acc * self.dt
+        angular_vel = jnp.clip(angular_vel,
+                               -self.max_angular_vel,
+                               self.max_angular_vel)
+
+        # speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_dir))
+        # current_speed_magnitude = jnp.linalg.norm(state.boat_vel)
+        # signed_speed = jax.lax.select(speed > 0, current_speed_magnitude, -current_speed_magnitude)
+        #
+        # angular_acc_due_to_act = action.squeeze() * signed_speed * 0.5  # Scale action effect, adjust constant
+        # # TODO if speed is zero then action has no effect, it may be good to have small constant so boat doesn't get "stuck" although this is realistic
+        # new_boat_angular_vel = state.boat_angular_acc * 0.97 + angular_acc_due_to_act * self.dt
+        # # TODO some decel modifier, maybe better way to state it
+        # new_boat_angular_acc = jnp.clip(new_boat_angular_vel,
+        #                                 -self.max_angular_vel,
+        #                                 self.max_angular_vel)
+
+        new_heading = state.boat_dir + angular_vel * self.dt
         new_heading = jnp.mod(new_heading, 2 * jnp.pi)  # Wrap heading to be within 0 and 2*pi
 
-        fcentripetal = new_boat_dir_acc * self.mass
-
-        unit_heading_2 = self.unit_vector(new_heading)
-        unit_perp_2 = self.perpendicular(unit_heading_2)
+        unit_heading = self.unit_vector(new_heading)
+        unit_perp = self.perpendicular(unit_heading)
 
         # 2. Calculate the angle between the boat heading and wind direction.
-        angle_diff = self.angle_to_wind(new_heading)
+        # angle_diff = self.angle_to_wind(new_heading)
 
         # 3. Calculate the speed multiplier based on the polar curve.
-        speed_multiplier = self.polar_curve(jnp.abs(angle_diff))  # TODO assuming polar curve is the same on both tacks
-        apparent_wind_2 = self.wind_vel - state.boat_vel
-        apparent_wind_speed = jnp.linalg.norm(apparent_wind_2)
+        # speed_multiplier = self.polar_curve(jnp.abs(angle_diff))  # TODO assuming polar curve is the same on both tacks
+        apparent_wind = self.wind_vel - state.boat_vel  # TODO is this correct?
+        apparent_wind_speed = jnp.linalg.norm(apparent_wind)
+        apparent_wind_angle = jnp.arctan2(apparent_wind[1], apparent_wind[0])
+        angle_to_apparent_wind = self.angle_to_wind(apparent_wind_angle)
+        sail_forward_coeff = self.polar_curve(angle_to_apparent_wind)
+        sail_side_coeff = jnp.zeros(())  # TODO sort this out from polar curve at some point
 
         # 4. Update boat speed, accounting for acceleration/deceleration.
-        SAILCOEFF = 7.0
-        fdrive_2 = speed_multiplier * apparent_wind_speed * SAILCOEFF * unit_heading_2
+        SAIL_DRIVE_COEFF = 8.0
+        SAIL_SIDE_COEFF = 0.5
+        fdrive = sail_forward_coeff * apparent_wind_speed ** 2 * SAIL_DRIVE_COEFF * unit_heading
+        fside_sail = sail_side_coeff * apparent_wind_speed ** 2 * SAIL_SIDE_COEFF * jnp.sign(angle_to_apparent_wind) * unit_perp
 
-        vforward_2 = jnp.dot(state.boat_vel, unit_heading_2) * unit_heading_2
-        vperpendicular_2 = state.boat_vel - vforward_2
+        v_forward = jnp.dot(state.boat_vel, unit_heading) * unit_heading
+        v_perp = state.boat_vel - v_forward
 
-        fdrag_2 = -vforward_2 * jnp.linalg.norm(vforward_2) * 100.0  # opposite to direction of movement
-        fkeel_2 = -vperpendicular_2 * jnp.linalg.norm(vperpendicular_2) * 1200.0
-        fperp_2 = unit_perp_2 * fcentripetal * jnp.linalg.norm(state.boat_vel)
+        DRAG_COEFF_FORWARD = 5.0  # Drag along the boat's direction
+        DRAG_COEFF_KEEL = 100.0  # High drag perpendicular to boat's direction (from keel)
 
-        new_boat_vel_2 = state.boat_vel + (fdrive_2 + fdrag_2 + fkeel_2 + fperp_2) / self.mass
+        fdrag_forward = -v_forward * jnp.linalg.norm(v_forward) * DRAG_COEFF_FORWARD
+        fdrag_keel = -v_perp * jnp.linalg.norm(v_perp) * DRAG_COEFF_KEEL
+
+        total_force = fdrive + fside_sail + fdrag_forward + fdrag_keel
+
+        acceleration_vector = total_force / self.mass
+        new_boat_vel = state.boat_vel + acceleration_vector * self.dt
+
+        # Optionally clip boat speed
+        # current_vel_mag = jnp.linalg.norm(new_boat_vel)
+        # new_boat_vel = jax.lax.select(current_vel_mag > self.max_speed,
+        #                               new_boat_vel * (self.max_speed / current_vel_mag),
+        #                               new_boat_vel)
 
         # 5. Update boat position based on heading and speed.
-        new_boat_pos_2 = state.boat_pos + new_boat_vel_2 * self.dt
-
-        # 6. Update boat path
-        old_path = jnp.roll(state.boat_path, 1, axis=-1)
-        new_boat_path = old_path.at[:, 0].set(new_boat_pos_2)
+        new_boat_pos = state.boat_pos + new_boat_vel * self.dt
 
         # Update state dict and evaluate termination conditions
-        new_state = EnvState(boat_pos=new_boat_pos_2,
-                         boat_dir=new_heading,
-                         boat_dir_acc=new_boat_dir_acc,
-                         boat_vel=new_boat_vel_2,
-                         boat_path=new_boat_path,
-                         time=state.time + 1,
-                         )
+        new_state = EnvState(boat_pos=new_boat_pos,
+                             boat_dir=new_heading,
+                             boat_angular_acc=angular_acc,
+                             boat_angular_vel=angular_vel,
+                             boat_vel=new_boat_vel,
+                             time=state.time + 1,
+                             )
 
         reward = self.reward_function(action, state, new_state, key)
 
@@ -119,7 +147,60 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                 jnp.array(reward),
                 self.is_done(new_state),
                 {"discount": self.discount(new_state)},
+                )
+
+    def polar_curve_tesy(self, angle_to_apparent_wind: float) -> Tuple[float, float]:
+        """
+        Simulated polar curve. Returns (forward_coeff, side_coeff) based on the
+        absolute angle to the apparent wind.
+        angle_to_apparent_wind is in [0, pi].
+
+        This version uses jax.lax.cond with correct operand passing for nested conditions.
+        """
+        # Ensure angle_to_apparent_wind is a scalar.
+        angle = angle_to_apparent_wind
+
+        # Define some key angles in radians
+        CLOSE_HAULED_ANGLE = jnp.pi / 4.0 # 45 degrees (too close to wind)
+        BEAM_REACH_ANGLE = jnp.pi / 2.0 # 90 degrees (best speed)
+
+        # Define the functions for jax.lax.cond
+        # Each function takes one argument, which is the 'operand' passed to cond
+        # In the outermost cond, the operand is 'angle'.
+        # In the inner cond, the operand is also 'angle'.
+
+        def _close_hauled_branch(current_angle): # Receives 'angle' as 'current_angle'
+            forward = jnp.array(0.0)
+            side = jnp.cos(current_angle) * 0.7
+            return forward, side
+
+        def _not_close_hauled_branch(current_angle): # Receives 'angle' as 'current_angle'
+            # This branch contains another jax.lax.cond
+            def _beam_reach_sub_branch(inner_angle): # Receives 'current_angle' as 'inner_angle'
+                forward = jnp.sin(inner_angle * 2) * 0.8
+                side = (1 - jnp.sin(inner_angle * 2)) * 0.3
+                return forward, side
+
+            def _running_sub_branch(inner_angle): # Receives 'current_angle' as 'inner_angle'
+                forward = jnp.sin(inner_angle) * 0.5
+                side = jnp.array(0.1)
+                return forward, side
+
+            return jax.lax.cond(
+                current_angle < BEAM_REACH_ANGLE, # Condition for inner branch
+                _beam_reach_sub_branch,           # Function if true
+                _running_sub_branch,              # Function if false
+                current_angle                     # OPERAND PASSED TO INNER FUNCTIONS
+            )
+
+        forward_coeff, side_coeff = jax.lax.cond(
+            angle < CLOSE_HAULED_ANGLE, # Condition for outer branch
+            _close_hauled_branch,       # Function if true
+            _not_close_hauled_branch,   # Function if false
+            angle                       # OPERAND PASSED TO OUTER FUNCTIONS
         )
+
+        return forward_coeff, side_coeff
 
     @staticmethod
     def polar_curve(theta):
@@ -162,30 +243,29 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
     def angle_to_wind(self, heading):
         angle_diff = heading - self.wind_dir
-        # Ensure the angle difference is between -pi and pi
-        return (angle_diff + jnp.pi) % (2 * jnp.pi) - jnp.pi
+        return (angle_diff + jnp.pi) % (2 * jnp.pi) - jnp.pi  # Ensure the angle difference is between -pi and pi
 
     def angle_to_mark(self, state):
         abs_angle = jnp.arctan2(self.marks[0, 0] - state.boat_pos[0], self.marks[0, 1] - state.boat_pos[1])
+        # TODO hardcoded just to do the first of the marks
         relative_angle = abs_angle - state.boat_dir
         normalised = (relative_angle + jnp.pi) % (2 * jnp.pi) - jnp.pi
         return normalised
 
     def dist_to_mark(self, state):
-        return self.marks[0] - state.boat_pos[0]
+        return self.marks[0] - state.boat_pos  # TODO hardcoded just to do the first of the marks
 
     def reset_env(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
         # init_state = jrandom.uniform(key, minval=-0.05, maxval=0.05, shape=(4,))
-        init_pos = jnp.array(((400.0,), (100.0,)))
-        init_dir = jnp.radians(jnp.ones(1,) * 90)
-        boat_speed = 1
+        init_pos = jnp.array(((self.screen_width/2,), (25,)))
+        init_dir = jnp.radians(jnp.ones(1,) * 45)
+        boat_speed = 1.0
         init_boat_vel = self.vector_decomp(boat_speed, init_dir)
         state = EnvState(boat_pos=init_pos.squeeze(axis=-1),
                          boat_dir=init_dir.squeeze(),
-                         boat_dir_acc=jnp.zeros(1,).squeeze(),
+                         boat_angular_acc=jnp.zeros(1,).squeeze(),
+                         boat_angular_vel=jnp.zeros(1,).squeeze(),
                          boat_vel=init_boat_vel.squeeze(axis=-1),
-                         # boat_path=jnp.repeat(init_pos, self.boat_path_length, axis=1),
-                         boat_path=jnp.repeat(init_pos, 40, axis=1),
                          time=0,
                          )
         return self.get_obs(state), state
@@ -203,15 +283,16 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         done_boundaries = jnp.logical_or(done_x, done_y)
         done_time = jax.lax.select(state_tp1.time >= 3000, jnp.array(True), jnp.array(False))
         overall_done = jnp.logical_or(done_time, done_boundaries)
-        # reward_dist = -jnp.linalg.norm(self.dist_to_mark(state, self), 8)#  / jnp.sqrt(jnp.square(self.screen_width) + jnp.square(self.screen_height))
-        reward_dist = jnp.linalg.norm(self.dist_to_mark(state_t), 8) - jnp.linalg.norm(self.dist_to_mark(state_tp1), 8)
+        # reward_dist = -jnp.linalg.norm(self.dist_to_mark(state_tp1), 8)#  / jnp.sqrt(jnp.square(self.screen_width) + jnp.square(self.screen_height))
+        reward_dist = 1.0 * (jnp.linalg.norm(self.dist_to_mark(state_t), 8) - jnp.linalg.norm(self.dist_to_mark(state_tp1), 8))
+        # reward_dist = -0.001 * (jnp.linalg.norm(self.dist_to_mark(state_t), 2))
         reward = jax.lax.select(overall_done, -100.0, reward_dist)
 
         return reward
 
     def action_convert(self,
                        action: Union[jnp.int_, jnp.float_, chex.Array]) -> Union[jnp.int_, jnp.float_, chex.Array]:
-        return jnp.clip(action, -self.max_action, self.max_action)
+        return jnp.clip(action, -self.max_action, self.max_action).squeeze()
 
     def get_obs(self, state, key: chex.PRNGKey = None) -> chex.Array:
         boat_speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_dir))
@@ -220,7 +301,8 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         dist_to_mark = self.dist_to_mark(state)
         obs = jnp.array([boat_speed,
                          angle_to_wind,
-                         state.boat_dir_acc,
+                         state.boat_angular_acc,
+                         state.boat_angular_vel,
                          angle_to_mark,
                          jnp.linalg.norm(dist_to_mark),
                         ])
@@ -251,160 +333,71 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         fig, ax = plt.subplots(figsize=(10, 10))
         ax.set_title(self.name)
         ax.set_xlim(0, self.screen_width)
-        # ax.set_xlabel("X")
         ax.set_ylim(0, self.screen_height)
-        # ax.set_ylabel("Y")
-        # ax.set_aspect('equal')
+        ax.set_xlabel("X (m)")
+        ax.set_xlabel("Y (m)")
+        ax.set_aspect('equal')
+        ax.set_facecolor((0.8, 1.0, 1.0))
         # ax.grid(True)
 
         # Draw wind angle
-        wind_length = 50
+        wind_length = 7
         wind_x = self.screen_width / 2
         wind_y = self.screen_height
-        end_x = wind_x + wind_length + jnp.sin(self.wind_dir)
-        end_y = wind_y + wind_length - jnp.cos(self.wind_dir)
-        ax.plot([wind_x, end_x], [wind_y, end_y])
+        dx = wind_length * jnp.sin(self.wind_dir)
+        dy = wind_length * -jnp.cos(self.wind_dir)
+        ax.arrow(wind_x, wind_y, dx, dy, width=1, label="Wind Direction")
 
         line, = ax.plot([], [], 'r-', lw=1.5, label='Agent Trail')
-        dot, = ax.plot([], [], color="purple", marker="o", markersize=12, label='Current State')
+        boat, = ax.plot([], [], color="purple", marker="o", markersize=12, label='Current State')
 
-        # # Draw marks
-        # for i in range(self.marks.shape[0]):
-        #     x, y = to_screen_coords(self.marks[i, 0], self.marks[i, 1])
-        #     gfxdraw.aacircle(screen, x, y, 4, (0, 0, 0))
-        #     gfxdraw.filled_circle(screen, x, y, 4, (0, 0, 0))
-        #
+        agent_path_history = jnp.array(((self.screen_width/2,), (25.0,)))  # TODO how to sort out this hardcoded values
+
+        # Draw marks
+        for i in range(self.marks.shape[0]):
+            ax.plot(self.marks[i, 0], self.marks[i, 1], color="orange", marker="o", markersize=12, label='Marks')
+
         # # Draw Speed Text
         # font = pygame.font.Font(None, 30)
         # speed_in_fwd_dir = state.boat_vel[0] * jnp.sin(state.boat_dir) + state.boat_vel[1] * jnp.cos(state.boat_dir)
         # speed_text = font.render(f"Speed: {jnp.squeeze(speed_in_fwd_dir):.2f} knots", True, (0, 0, 0))
         # screen.blit(speed_text, (10, 10))
-        #
-        # # Draw Time Text
-        # time_text = font.render(f"Time: {state.time}", True, (0, 0, 0))
-        # screen.blit(time_text, (10, 40))
-        #
-        # # Draw Position Text
-        # pos_text = font.render(f"Position: ({state.boat_pos[0]:.2f}, {state.boat_pos[1]:.2f})", True, (0, 0, 0))
-        # screen.blit(pos_text, (10, 70))
 
         def update(frame):
+
+            global agent_path_history
+
             # boat_angle = jnp.squeeze(state.boat_dir[frame])
-            x, y = (trajectory_state.boat_pos[frame, 0], trajectory_state.boat_pos[frame, 1])
-            dot.set_data(jnp.expand_dims(x, axis=0), jnp.expand_dims(y, axis=0))
-            # line.set_data(agent_path_history[0], agent_path_history[1])
-            return line, dot
+            x, y = (jnp.expand_dims(trajectory_state.boat_pos[frame, 0], axis=0),
+                    jnp.expand_dims(trajectory_state.boat_pos[frame, 1], axis=0))
+
+            if x == self.screen_width/2 and y == 25.0:  # TODO figure out how to sort out this hardcoded fix
+                agent_path_history = jnp.array(((self.screen_width/2,), (25.0,)))
+            else:
+                xy = jnp.concatenate((jnp.expand_dims(x, 0), jnp.expand_dims(y, 0)))
+                agent_path_history = jnp.concatenate((agent_path_history, xy), axis=-1)
+
+            boat.set_data(x, y)
+
+            line.set_data(agent_path_history[0], agent_path_history[1])
+
+            reward = self.reward_function(jnp.zeros(1,),
+                                         jax.tree.map(lambda x: x[frame], trajectory_state),
+                                         jax.tree.map(lambda x: x[frame+1], trajectory_state),
+                                         jrandom.key(42))
+            ax.set_title(f"Reward = {reward:.3f}")
+
+            return line, boat
 
         # Create the animation
         anim = animation.FuncAnimation(fig,
                                        update,
                                        frames=trajectory_state.time.shape[0],
-                                       interval=self.dt * 10,  # Convert dt to milliseconds
+                                       interval=self.dt * 1000,  # Convert dt to milliseconds
                                        blit=True
                                        )
         anim.save(f"../animations/{self.name}.gif")
         plt.close()
-
-    def render(self, state: EnvState, render_delay: float = 0.0):
-        """
-        Remember width is left to right increasing
-        BUT height is top to bottom increasing
-        """
-        if not hasattr(self, '_display'):
-            pygame.init()
-            self._display = pygame.display.set_mode((self.screen_width, self.screen_height))
-            pygame.display.set_caption("Sailing Simulator")
-        screen = self._display
-        screen.fill((240, 240, 240))  # Light gray background
-
-        # Convert state variables to screen coordinates
-        def to_screen_coords(x, y):
-            # x_offset = screen_width / 2
-            # y_offset = screen_height / 2
-            # scale = 50  # Adjust this scaling factor as needed
-            # return (int(x_offset + x * scale), int((1 - y) * screen_height / 2))  # y is flipped in screen coords
-            flip_y = (1 - (y / self.screen_height)) * self.screen_height
-            return int(x), int(flip_y)
-
-        # Draw Boat Path
-        path_length = 30
-        for i in range(path_length):
-            p = state.boat_path[:, i]
-            x, y = to_screen_coords(p[0], p[1])
-            gfxdraw.aacircle(screen, x, y, 1, (0, 0, 255))
-            gfxdraw.filled_circle(screen, x, y, 1, (0, 0, 255))
-
-        # Draw Boat
-        boat_angle = jnp.squeeze(state.boat_dir)
-        boat_x_screen, boat_y_screen = to_screen_coords(state.boat_pos[0], state.boat_pos[1])
-
-        # Load and rotate the boat image.
-        boat_image_path = "boaty_boat.png"
-        boat_image = pygame.image.load(boat_image_path).convert_alpha()
-        # Scale the image
-        original_boat_width, original_boat_height = boat_image.get_size()
-        boat_scale = 0.02
-        new_boat_width = int(original_boat_width * boat_scale)
-        new_boat_height = int(original_boat_height * boat_scale)
-        scaled_boat_image = pygame.transform.scale(boat_image, (new_boat_width, new_boat_height))
-        # Rotate the image.  pygame rotation is counter-clockwise, so we negate the angle.
-        rotated_boat_image = pygame.transform.rotate(scaled_boat_image, -jnp.degrees(boat_angle))
-        # Get the center of the rotated image.
-        boat_rect = rotated_boat_image.get_rect(center=(boat_x_screen, boat_y_screen))
-        # Blit the rotated image onto the screen.
-        screen.blit(rotated_boat_image, boat_rect)
-
-        boat_length = 10
-        end_x = boat_x_screen + boat_length * jnp.sin(boat_angle)
-        end_y = boat_y_screen - boat_length * jnp.cos(boat_angle)
-        pygame.draw.line(screen, (255, 0, 0), (int(boat_x_screen), int(boat_y_screen)), (int(end_x), int(end_y)), 2)
-        pygame.draw.circle(screen, (255, 0, 0), (int(boat_x_screen), int(boat_y_screen)), boat_length/2, 1)
-
-        # Draw Wind Arrow
-        wind_angle = self.wind_dir
-        wind_length = 50
-        wind_x = self.screen_width / 2
-        wind_y = 0
-        end_x = wind_x + wind_length * jnp.sin(wind_angle)
-        end_y = wind_y + wind_length * jnp.cos(wind_angle)
-
-        # Draw the wind arrow using gfxdraw for antialiasing
-        pygame.draw.line(screen, (255, 0, 0), (wind_x, wind_y), (int(end_x), int(end_y)), 2)
-        arrow_head_size = 10
-        arrow_tip = (int(end_x), int(end_y))
-        arrow_left = (int(end_x + arrow_head_size * jnp.sin(wind_angle - jnp.pi / 6)),
-                      int(end_y - arrow_head_size * jnp.cos(wind_angle - jnp.pi / 6)))
-        arrow_right = (int(end_x + arrow_head_size * jnp.sin(wind_angle + jnp.pi / 6)),
-                       int(end_y - arrow_head_size * jnp.cos(wind_angle + jnp.pi / 6)))
-        gfxdraw.aapolygon(screen, [arrow_tip, arrow_left, arrow_right], (255, 0, 0))
-        gfxdraw.filled_polygon(screen, [arrow_tip, arrow_left, arrow_right], (255, 0, 0))
-        # TODO check all the above actually works
-
-        # Draw marks
-        for i in range(self.marks.shape[0]):
-            x, y = to_screen_coords(self.marks[i, 0], self.marks[i, 1])
-            gfxdraw.aacircle(screen, x, y, 4, (0, 0, 0))
-            gfxdraw.filled_circle(screen, x, y, 4, (0, 0, 0))
-
-        # Draw Speed Text
-        font = pygame.font.Font(None, 30)
-        speed_in_fwd_dir = state.boat_vel[0] * jnp.sin(state.boat_dir) + state.boat_vel[1] * jnp.cos(state.boat_dir)
-        speed_text = font.render(f"Speed: {jnp.squeeze(speed_in_fwd_dir):.2f} knots", True, (0, 0, 0))
-        screen.blit(speed_text, (10, 10))
-
-        # Draw Time Text
-        time_text = font.render(f"Time: {state.time}", True, (0, 0, 0))
-        screen.blit(time_text, (10, 40))
-
-        # Draw Position Text
-        pos_text = font.render(f"Position: ({state.boat_pos[0]:.2f}, {state.boat_pos[1]:.2f})", True, (0, 0, 0))
-        screen.blit(pos_text, (10, 70))
-
-        pygame.display.flip()
-        pygame.event.pump()  # Process events to prevent freezing
-        time.sleep(render_delay)
-
-        # return screen
 
     @property
     def name(self) -> str:
@@ -414,9 +407,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         return spaces.Box(-self.max_action, self.max_action, (1,), dtype=jnp.float32)
 
     def observation_space(self) -> spaces.Box:
-        max_speed = 2
         max_dist = jnp.sqrt(jnp.square(self.screen_width) + jnp.square(self.screen_height))
-        max_accel = 2.0
         # TODO sort out the above to be a bit better
         low = jnp.array([0.0,
                          -jnp.pi,
@@ -424,9 +415,9 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                          -jnp.pi,
                          0.0,
                          ])
-        high = jnp.array([max_speed,
+        high = jnp.array([self.max_speed,
                           jnp.pi,
-                          max_accel,
+                          self.acceleration,  # TODO check this is correct
                           jnp.pi,
                           max_dist,
                           ])
@@ -443,7 +434,6 @@ class SailingEnvCSDA(SailingEnvCSCA):
                        action: Union[jnp.int_, jnp.float_, chex.Array]) -> Union[jnp.int_, jnp.float_, chex.Array]:
         return self.action_array[action] * self.max_action
 
-
     def action_space(self) -> spaces.Discrete:
         return spaces.Discrete(len(self.action_array))
 
@@ -451,51 +441,26 @@ if __name__ == '__main__':
     with jax.disable_jit(disable=False):
         key = jrandom.PRNGKey(42)
 
-        # Instantiate the environment & its settings.
         env = SailingEnvCSCA()
 
-        # Reset the environment.
         key, _key = jrandom.split(key)
         obs, state = env.reset(_key)
 
-        time_steps = 30#00  # 500
-        # start_time = time.time()
-        returns = 0
-        # for _ in range(time_steps):
-        #     # Sample a random action.
-        #     key, _key = jrandom.split(key)
-        #     # action = env.action_space(env_self).sample(_key)
-        #     # action = jnp.zeros(1,)
-        #     action = jnp.ones(1,) * -0.001
-        #
-        #     # env.render(state, env_self, render_delay=0.05)
-        #     env.render(state)
-        #
-        #     # Perform the step transition.
-        #     key, _key = jrandom.split(key)
-        #     obs, delta_obs, state, reward, done, _ = env.step(action, state, _key)
-        #     returns += reward
-        #     print(returns)
-        #
-        #     if done:
-        #         break
+        time_steps = 100#0#0#0
 
         def _step(runner_state, unused):
             obs, state, key = runner_state
             key, _key = jrandom.split(key)
-            action = env.action_space().sample(_key)
+            # action = env.action_space().sample(_key)
             # action = jnp.zeros(1,)
-            # action = jnp.ones(1,) * -0.001
+            action = jnp.ones(1,)
 
-            # env.render(state, env_self, render_delay=0.05)
-            # env.render(state)
-
-            # Perform the step transition.
             key, _key = jrandom.split(key)
             nobs, delta_obs, nstate, reward, done, _ = env.step(action, state, _key)
 
             return (nobs, nstate, key), state
 
-        _, traj_state = jax.lax.scan(_step, (obs, state, key), None, time_steps)
+        with jax.disable_jit(disable=True):
+            _, traj_state = jax.lax.scan(_step, (obs, state, key), None, time_steps)
         env.render_traj(traj_state)
 

@@ -31,33 +31,21 @@ class ActorCritic(nn.Module):
             activation = nn.relu
         else:
             activation = nn.tanh
-        actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
+        actor_mean = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(actor_mean)
+        actor_mean = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(actor_mean)
         actor_mean = activation(actor_mean)
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
+        actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(actor_mean)
 
         # actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
         # pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
         pi = distrax.Categorical(logits=actor_mean)
 
-        critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(x)
+        critic = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         critic = activation(critic)
-        critic = nn.Dense(
-            256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(critic)
+        critic = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(critic)
         critic = activation(critic)
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(critic)
 
         return pi, jnp.squeeze(critic, axis=-1)
 
@@ -95,22 +83,21 @@ def make_train(env, config):
     def train(rng):
         # INIT NETWORK
         network = ActorCritic(env.action_space().num_discrete, activation=config["ACTIVATION"])
+        # network = ActorCritic(env.action_space().shape[0], activation=config["ACTIVATION"])
         rng, _rng = jax.random.split(rng)
         init_x = jnp.zeros(env.observation_space().shape)
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=linear_schedule, eps=1e-5),
-            )
+            tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                             optax.adam(learning_rate=linear_schedule, eps=1e-5),
+                             )
         else:
-            tx = optax.chain(
-                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(config["LR"], eps=1e-5),
-            )
+            tx = optax.chain(optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                             optax.adam(config["LR"], eps=1e-5),
+                             )
         train_state = TrainState.create(apply_fn=network.apply,
                                         params=network_params,
-                                        tx=tx
+                                        tx=tx,
                                         )
 
         # INIT ENV
@@ -156,13 +143,12 @@ def make_train(env, config):
 
                     return (gae, value), gae
 
-                _, advantages = jax.lax.scan(
-                    _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
-                    traj_batch,
-                    reverse=True,
-                    unroll=16,
-                )
+                _, advantages = jax.lax.scan(_get_advantages,
+                                             (jnp.zeros_like(last_val), last_val),
+                                             traj_batch,
+                                             reverse=True,
+                                             unroll=16,
+                                             )
                 return advantages, advantages + traj_batch.value
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
@@ -188,22 +174,20 @@ def make_train(env, config):
                         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - config["CLIP_EPS"],
-                                1.0 + config["CLIP_EPS"],
-                            )
+                            jnp.clip(ratio,
+                                     1.0 - config["CLIP_EPS"],
+                                     1.0 + config["CLIP_EPS"],
+                                     )
                             * gae
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
 
-                        total_loss = (
-                            loss_actor
-                            + config["VF_COEF"] * value_loss
-                            - config["ENT_COEF"] * entropy
-                        )
+                        total_loss = (loss_actor
+                                      + config["VF_COEF"] * value_loss
+                                      - config["ENT_COEF"] * entropy
+                                      )
                         return total_loss, (value_loss, loss_actor, entropy)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -260,29 +244,34 @@ def make_train(env, config):
 def make_eval(env, config, train_state):
     # INIT NETWORK
     network = ActorCritic(env.action_space().num_discrete, activation=config["ACTIVATION"])
+    # network = ActorCritic(env.action_space().shape[0], activation=config["ACTIVATION"])
     rng = jrandom.key(42)
     rng, _rng = jax.random.split(rng)
     obsv, env_state = env.reset(_rng)
 
     print("HERE")
 
-    for _ in range(1000):
+    def _env_step(runner_state, unused):
+        train_state, env_state, last_obs, rng = runner_state
+
         # SELECT ACTION
         rng, _rng = jax.random.split(rng)
-        pi, value = network.apply(train_state.params, obsv)
+        pi, value = network.apply(train_state.params, last_obs)
         action = pi.sample(seed=_rng)
 
         # STEP ENV
         rng, _rng = jax.random.split(rng)
-        obsv, _, env_state, reward, done, info = env.step(action, env_state, _rng)
+        obsv, _, nenv_state, reward, done, info = env.step(action, env_state, _rng)
+        runner_state = (train_state, nenv_state, obsv, rng)
+        return runner_state, env_state
 
-        env.render(env_state)
-
+    _, traj_batch = jax.lax.scan(_env_step, (train_state, env_state, obsv, rng), None, 1000)
+    env.render_traj(traj_batch)
 
 if __name__ == "__main__":
     config = {
         "LR": 3e-4,
-        "NUM_ENVS": 32,  # 2048,
+        "NUM_ENVS": 64,  # 2048,
         "NUM_STEPS": 64,
         "TOTAL_TIMESTEPS": 1000000,  # 5e7,
         "UPDATE_EPOCHS": 4,
@@ -302,7 +291,7 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(30)
 
     env = SailingEnvCSDA()
-    env = wrappers.NormalisedWrapperCSDA(env)
+    # env = wrappers.NormalisedWrapperCSCA(env)
     env = wrappers.AutoResetWrapper(env)
 
     train_jit = jax.jit(make_train(env, config))
