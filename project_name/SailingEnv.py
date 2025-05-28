@@ -11,16 +11,17 @@ from typing import Dict, Tuple, Any, Union, Optional
 @struct.dataclass
 class EnvState(base_env.EnvState):
     boat_pos: jnp.ndarray
-    boat_dir: jnp.ndarray
-    boat_angular_acc: jnp.ndarray
-    boat_angular_vel: jnp.ndarray
     boat_vel: jnp.ndarray
+    boat_heading: jnp.ndarray
+    boat_heading_rate: jnp.ndarray
     time: int
 
 
 class SailingEnvCSCA(base_env.BaseEnvironment):
     """
     0 degrees is the top of the screen or defined as north
+    wind x y is global
+    boat has a local x y
     """
     def __init__(self, **env_kwargs):
         super().__init__(**env_kwargs)
@@ -28,8 +29,6 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         self.dt: float = 0.1
 
         self.max_steps_in_episode: int = 500
-        self.wind_dir: float = 0.0
-        self.wind_vel: jnp.ndarray = jnp.array((0.0, -7.0)) # in ms^-1
         self.max_action: float = 1.0
         self.max_speed: float = 5.0  # Max boat speed in ms^-1
         self.max_angular_vel: float = jnp.pi / 2.0  # Max angular velocity (rad/s), roughly 90 deg/s
@@ -38,8 +37,43 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         self.acceleration: float = 10.0  # in ms^-2
         self.deceleration: float = 20.0  # in ms^-2
         # TODO adjust the accels above
+        self.mass: float = 120.0  # in kg  # used to be 120
 
-        self.mass: float = 120.0  # in kg
+        self.wind_dir: float = 0.0  # deg
+        self.wind_speed: float = 5.0  # in ms^-1
+        self.wind_vel: jnp.ndarray = self.wind_speed * jnp.array((jnp.sin(jnp.radians(self.wind_dir)),
+                                                                  jnp.cos(jnp.radians(self.wind_dir))))  # in ms^-1
+
+        self.mass: float = 350.0  # in kg  # used to be 120
+        self.max_rudder_angle = jnp.radians(45.0)
+        self.water_density = 1000  # [kg/m^3]
+        self.rudder_stretching = 2.326923076923077
+        self.rudder_blade_area = 0.13  # [m^2]
+        self.air_density =  1.3 # [kg/m^3]
+        self.air_viscosity = 0.0000171 # [Pa * s]
+        self.sail_length = 1 # [m]
+        self.sail_stretching = 0.961
+        self.sail_area = 6.2 # [m]
+        self.water_viscosity = 0.0000001 # [Pa *
+        self.keel_length = 2 # [m]
+        self.keel_stretching = 0.605
+        self.lateral_area = 2.5 # [m^2]
+        self.hull_speed = 2.5
+        self.distance_cog_rudder = 1.24 # [m]
+        self.distance_cog_sail_pressure_point = 0.24 # [m]
+        self.distance_mast_sail_pressure_point = 0.68 # [m]
+        self.distance_cog_keel_pressure_point = 0.24 # [m]
+        self.distance_cog_keel_middle = self.distance_cog_keel_pressure_point - .7
+
+        self.along_damping = 15
+        self.transverse_damping = 5
+        self.yaw_timeconstant = 5
+        self.moi_z = 1066
+
+        self.damping_invariant_x = -self.mass / self.along_damping
+        self.damping_invariant_y = -self.mass / self.transverse_damping
+        self.damping_invariant_yaw = -(self.moi_z / self.yaw_timeconstant)
+        self.wave_impedance_invariant = (self.water_density / 2) * self.lateral_area
 
         self.screen_width: int = 100 # in m
         self.screen_height: int = 100 # in m
@@ -53,87 +87,132 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                  state: EnvState,
                  key: chex.PRNGKey,
                  ) -> Tuple[chex.Array, chex.Array, EnvState, chex.Array, chex.Array, Dict[Any, Any]]:
-        # 1. Update boat heading based on action
+        # 1) Get important values
+        speed = jnp.sqrt(state.boat_vel[0] ** 2 + state.boat_vel[1] ** 2)
+
+        transformed_x = self.wind_vel[0] * jnp.sin(state.boat_heading) - self.wind_vel[1] * jnp.cos(state.boat_heading)
+        transformed_y = self.wind_vel[1] * jnp.sin(state.boat_heading) + self.wind_vel[0] * jnp.cos(state.boat_heading)
+        # TODO check the positive and negatives for vy
+
+        apparent_wind_x = transformed_x - state.boat_vel[0]
+        apparent_wind_y = transformed_y - state.boat_vel[1]
+        apparent_wind_angle = jnp.arctan2(-apparent_wind_y, -apparent_wind_x)
+        apparent_wind_speed = jnp.sqrt(apparent_wind_x ** 2 + apparent_wind_y ** 2)
+
+        # 2) Update boat heading based on action
         action = self.action_convert(input_action)
 
-        RUDDER_MAX_FORCE_COEFF: float = 50.0
+        rudder_angle = jnp.clip(action, -self.max_rudder_angle, self.max_rudder_angle)
+        sail_angle = 10.0  # can range between -90 and +90 generally
+        true_sail_angle = jnp.sign(apparent_wind_angle) * abs(sail_angle)
+        # TODO assume that can just change rudder as desired, there is no latency involved
 
-        rudder_force_magnitude = action * RUDDER_MAX_FORCE_COEFF * (jnp.linalg.norm(state.boat_vel) ** 2)
-        angular_acc = rudder_force_magnitude / self.mass
-        angular_acc = jnp.clip(angular_acc,
-                               -self.max_angular_vel,
-                               self.max_angular_vel)
+        # 3) Calc rudder force
+        pressure = (self.water_density / 2) * speed ** 2
+        rudder_force_x = -(((4 * jnp.pi) / self.rudder_stretching) * rudder_angle ** 2) * pressure * self.rudder_blade_area
+        rudder_force_y = 2 * jnp.pi * pressure * self.rudder_blade_area * rudder_angle
 
-        angular_vel = state.boat_angular_vel + angular_acc * self.dt
-        angular_vel = jnp.clip(angular_vel,
-                               -self.max_angular_vel,
-                               self.max_angular_vel)
+        # 4) Calc sail force
+        aoa = self.wind_dir - true_sail_angle
+        aoa = jax.lax.select(aoa * true_sail_angle < 0, 0.0, aoa)
+        # if aoa * true_sail_angle < 0:
+        #     aoa = 0
 
-        # speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_dir))
-        # current_speed_magnitude = jnp.linalg.norm(state.boat_vel)
-        # signed_speed = jax.lax.select(speed > 0, current_speed_magnitude, -current_speed_magnitude)
-        #
-        # angular_acc_due_to_act = action.squeeze() * signed_speed * 0.5  # Scale action effect, adjust constant
-        # # TODO if speed is zero then action has no effect, it may be good to have small constant so boat doesn't get "stuck" although this is realistic
-        # new_boat_angular_vel = state.boat_angular_acc * 0.97 + angular_acc_due_to_act * self.dt
-        # # TODO some decel modifier, maybe better way to state it
-        # new_boat_angular_acc = jnp.clip(new_boat_angular_vel,
-        #                                 -self.max_angular_vel,
-        #                                 self.max_angular_vel)
+        eff_aoa = aoa  # eff_aoa : effective angle of attack
+        eff_aoa = jnp.where(aoa < -jnp.pi / 2, jnp.pi + aoa, eff_aoa)
+        eff_aoa = jnp.where(aoa > jnp.pi / 2, -jnp.pi + aoa, eff_aoa)
+        # TODO is the above correct hmmm
+        # if aoa < -jnp.pi / 2:
+        #     eff_aoa = jnp.pi + aoa
+        # elif aoa > jnp.pi / 2:
+        #     eff_aoa = -jnp.pi + aoa
 
-        new_heading = state.boat_dir + angular_vel * self.dt
-        new_heading = jnp.mod(new_heading, 2 * jnp.pi)  # Wrap heading to be within 0 and 2*pi
+        pressure = (self.air_density / 2) * apparent_wind_speed ** 2 * jnp.cos(jnp.cos(true_sail_angle)) ** 2
 
-        unit_heading = self.unit_vector(new_heading)
-        unit_perp = self.perpendicular(unit_heading)
+        aero_friction = jax.lax.select(apparent_wind_speed != 0,
+                                       3.55 * jnp.sqrt(self.air_viscosity / (apparent_wind_speed * self.sail_length)),
+                                       0.0)
 
-        # 2. Calculate the angle between the boat heading and wind direction.
-        # angle_diff = self.angle_to_wind(new_heading)
+        separation = 1 - jnp.exp(-((abs(eff_aoa)) / (jnp.pi / 180 * 25)) ** 2)
 
-        # 3. Calculate the speed multiplier based on the polar curve.
-        # speed_multiplier = self.polar_curve(jnp.abs(angle_diff))  # TODO assuming polar curve is the same on both tacks
-        apparent_wind = self.wind_vel - state.boat_vel  # TODO is this correct?
-        apparent_wind_speed = jnp.linalg.norm(apparent_wind)
-        apparent_wind_angle = jnp.arctan2(apparent_wind[1], apparent_wind[0])
-        angle_to_apparent_wind = self.angle_to_wind(apparent_wind_angle)
-        sail_forward_coeff = self.polar_curve(angle_to_apparent_wind)
-        sail_side_coeff = jnp.zeros(())  # TODO sort this out from polar curve at some point
+        propulsion = (2 * jnp.pi * eff_aoa * jnp.sin(apparent_wind_angle) \
+                      - (aero_friction + (4 * jnp.pi * eff_aoa ** 2 * separation) / self.sail_stretching) * jnp.cos(apparent_wind_angle)) \
+                     * self.sail_area * pressure
 
-        # 4. Update boat speed, accounting for acceleration/deceleration.
-        SAIL_DRIVE_COEFF = 8.0
-        SAIL_SIDE_COEFF = 0.5
-        fdrive = sail_forward_coeff * apparent_wind_speed ** 2 * SAIL_DRIVE_COEFF * unit_heading
-        fside_sail = sail_side_coeff * apparent_wind_speed ** 2 * SAIL_SIDE_COEFF * jnp.sign(angle_to_apparent_wind) * unit_perp
+        transverse_force = (-2 * jnp.pi * eff_aoa * jnp.cos(apparent_wind_angle) \
+                            - (aero_friction + (4 * jnp.pi * eff_aoa ** 2 * separation) / self.sail_stretching) * jnp.sin(apparent_wind_angle)) \
+                           * self.sail_area * pressure
 
-        v_forward = jnp.dot(state.boat_vel, unit_heading) * unit_heading
-        v_perp = state.boat_vel - v_forward
+        separated_propulsion = jnp.sign(aoa) * pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.sin(true_sail_angle)
+        separated_transverse_force = -jnp.sign(aoa) * pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.cos(true_sail_angle)
 
-        DRAG_COEFF_FORWARD = 5.0  # Drag along the boat's direction
-        DRAG_COEFF_KEEL = 100.0  # High drag perpendicular to boat's direction (from keel)
+        sail_force_x = (1 - separation) * propulsion + separation * separated_propulsion
+        sail_force_y = (1 - separation) * transverse_force + separation * separated_transverse_force
 
-        fdrag_forward = -v_forward * jnp.linalg.norm(v_forward) * DRAG_COEFF_FORWARD
-        fdrag_keel = -v_perp * jnp.linalg.norm(v_perp) * DRAG_COEFF_KEEL
+        # 5) Calculate lateral force
+        hydro_friction = jax.lax.select(speed != 0,
+                                        2.66 * jnp.sqrt(self.water_viscosity / (speed * self.keel_length)),
+                                        0.0)
 
-        total_force = fdrive + fside_sail + fdrag_forward + fdrag_keel
+        #     aoa :           angle of attack
+        # eff_aoa : effective angle of attack
+        eff_aoa = aoa = jnp.arctan2(state.boat_vel[1], state.boat_vel[0])
+        eff_aoa = jnp.where(aoa < -jnp.pi / 2, jnp.pi + aoa, eff_aoa)
+        eff_aoa = jnp.where(aoa > jnp.pi / 2, -jnp.pi + aoa, eff_aoa)
+        # TODO is the above correct hmmm
+        # if aoa < -jnp.pi / 2:
+        #     eff_aoa = jnp.pi + aoa
+        # elif aoa > jnp.pi / 2:
+        #     eff_aoa = -jnp.pi + aoa
 
-        acceleration_vector = total_force / self.mass
-        new_boat_vel = state.boat_vel + acceleration_vector * self.dt
+        lateral_separation = 1 - jnp.exp(-((abs(eff_aoa)) / (jnp.pi / 180 * 25)) ** 2)
 
-        # Optionally clip boat speed
-        # current_vel_mag = jnp.linalg.norm(new_boat_vel)
-        # new_boat_vel = jax.lax.select(current_vel_mag > self.max_speed,
-        #                               new_boat_vel * (self.max_speed / current_vel_mag),
-        #                               new_boat_vel)
+        # Identical calculation for x and y
+        tmp = -(hydro_friction + (4 * jnp.pi * eff_aoa ** 2 * separation) / self.keel_stretching)
 
-        # 5. Update boat position based on heading and speed.
-        new_boat_pos = state.boat_pos + new_boat_vel * self.dt
+        separated_transverse_force = -jnp.sign(aoa) * pressure * self.sail_area * jnp.sin(aoa) ** 2
+
+        lateral_force_x = (1 - lateral_separation) * (tmp * jnp.cos(aoa) + 2 * jnp.pi * eff_aoa * jnp.sin(aoa)) * pressure * self.lateral_area
+        lateral_force_y = (1 - lateral_separation) * (tmp * jnp.sin(aoa) - 2 * jnp.pi * eff_aoa * jnp.cos(aoa)) * pressure * self.lateral_area + lateral_separation * separated_transverse_force
+
+        # 6) Calc damping
+        damping_x = self.damping_invariant_x * state.boat_vel[0]
+        damping_y = self.damping_invariant_y * state.boat_vel[1]
+        damping_yaw = self.damping_invariant_yaw * state.boat_heading_rate
+
+        # 7) Calc wave impedance
+        wave_impedance = -jnp.sign(state.boat_vel[0]) * speed**2 * (speed / self.hull_speed)**2 * self.wave_impedance_invariant
+
+        delta_pos_x = state.boat_vel[0] * jnp.sin(state.boat_heading) - state.boat_vel[1] * jnp.cos(state.boat_heading)
+        delta_pos_y = state.boat_vel[1] * jnp.sin(state.boat_heading) + state.boat_vel[0] * jnp.cos(state.boat_heading)
+        # TODO check the positive and negatives for vy
+
+        delta_yaw = state.boat_heading_rate  # * jnp.cos(roll) + pitch_rate * jnp.sin(roll)
+
+        delta_vel_x = delta_yaw * state.boat_vel[1] + (sail_force_x + lateral_force_x + rudder_force_x + damping_x + wave_impedance) / self.mass
+
+        delta_vel_y = -delta_yaw * state.boat_vel[0] + ((sail_force_y + lateral_force_y + rudder_force_y) + damping_y) / self.mass
+
+        # delta_yaw_rate = (damping_yaw
+        #                   # + hydrostatic_force.z * hydrostatic_force.x * sin(roll)
+        #                   - rudder_force_y * self.distance_cog_rudder
+        #                   + sail_force_y * self.distance_cog_sail_pressure_point
+        #                   + sail_force_x * jnp.sin(true_sail_angle) * self.distance_mast_sail_pressure_point
+        #                   + lateral_force_y * (self.distance_cog_keel_pressure_point * (1 - lateral_separation) + self.distance_cog_keel_middle * lateral_separation)) / self.moi_z
+
+        # 8) Apply differential step
+        new_boat_pos = state.boat_pos + jnp.array((delta_pos_x, delta_pos_y)) * self.dt
+        # new_boat_heading = state.boat_heading + delta_yaw * self.dt
+        new_boat_vel = state.boat_vel + jnp.array((delta_vel_x, delta_vel_y)) * self.dt
+        # new_boat_heading_rate = state.boat_heading_rate + delta_yaw_rate * self.dt
+
+        # TODO do I have to normalise heading to ensure between a set range
 
         # Update state dict and evaluate termination conditions
         new_state = EnvState(boat_pos=new_boat_pos,
-                             boat_dir=new_heading,
-                             boat_angular_acc=angular_acc,
-                             boat_angular_vel=angular_vel,
+                             boat_heading=state.boat_heading,
                              boat_vel=new_boat_vel,
+                             boat_heading_rate=state.boat_heading_rate,
                              time=state.time + 1,
                              )
 
@@ -248,7 +327,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
     def angle_to_mark(self, state):
         abs_angle = jnp.arctan2(self.marks[0, 0] - state.boat_pos[0], self.marks[0, 1] - state.boat_pos[1])
         # TODO hardcoded just to do the first of the marks
-        relative_angle = abs_angle - state.boat_dir
+        relative_angle = abs_angle - state.boat_heading
         normalised = (relative_angle + jnp.pi) % (2 * jnp.pi) - jnp.pi
         return normalised
 
@@ -258,14 +337,12 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
     def reset_env(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
         # init_state = jrandom.uniform(key, minval=-0.05, maxval=0.05, shape=(4,))
         init_pos = jnp.array(((self.screen_width/2,), (25,)))
-        init_dir = jnp.radians(jnp.ones(1,) * 45)
-        boat_speed = 1.0
-        init_boat_vel = self.vector_decomp(boat_speed, init_dir)
-        state = EnvState(boat_pos=init_pos.squeeze(axis=-1),
-                         boat_dir=init_dir.squeeze(),
-                         boat_angular_acc=jnp.zeros(1,).squeeze(),
-                         boat_angular_vel=jnp.zeros(1,).squeeze(),
-                         boat_vel=init_boat_vel.squeeze(axis=-1),
+        init_dir = jnp.radians(jnp.ones(1,) * 90)
+        init_boat_vel = jnp.array((0.0, 0.0))
+        state = EnvState(boat_pos=init_pos.squeeze(),
+                         boat_vel=init_boat_vel.squeeze(),
+                         boat_heading=init_dir.squeeze(),
+                         boat_heading_rate=jnp.zeros(()),
                          time=0,
                          )
         return self.get_obs(state), state
@@ -295,14 +372,13 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         return jnp.clip(action, -self.max_action, self.max_action).squeeze()
 
     def get_obs(self, state, key: chex.PRNGKey = None) -> chex.Array:
-        boat_speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_dir))
-        angle_to_wind = self.angle_to_wind(state.boat_dir)
+        boat_speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_heading))
+        angle_to_wind = self.angle_to_wind(state.boat_heading)
         angle_to_mark = self.angle_to_mark(state)
         dist_to_mark = self.dist_to_mark(state)
         obs = jnp.array([boat_speed,
                          angle_to_wind,
-                         state.boat_angular_acc,
-                         state.boat_angular_vel,
+                         state.boat_heading_rate,
                          angle_to_mark,
                          jnp.linalg.norm(dist_to_mark),
                         ])
@@ -335,7 +411,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         ax.set_xlim(0, self.screen_width)
         ax.set_ylim(0, self.screen_height)
         ax.set_xlabel("X (m)")
-        ax.set_xlabel("Y (m)")
+        ax.set_ylabel("Y (m)")
         ax.set_aspect('equal')
         ax.set_facecolor((0.8, 1.0, 1.0))
         # ax.grid(True)
@@ -443,24 +519,25 @@ if __name__ == '__main__':
 
         env = SailingEnvCSCA()
 
-        key, _key = jrandom.split(key)
-        obs, state = env.reset(_key)
-
-        time_steps = 100#0#0#0
-
-        def _step(runner_state, unused):
-            obs, state, key = runner_state
-            key, _key = jrandom.split(key)
-            # action = env.action_space().sample(_key)
-            # action = jnp.zeros(1,)
-            action = jnp.ones(1,)
-
-            key, _key = jrandom.split(key)
-            nobs, delta_obs, nstate, reward, done, _ = env.step(action, state, _key)
-
-            return (nobs, nstate, key), state
-
         with jax.disable_jit(disable=True):
+            key, _key = jrandom.split(key)
+            obs, state = env.reset(_key)
+
+            time_steps = 80#0#0#0
+
+            def _step(runner_state, unused):
+                obs, state, key = runner_state
+                key, _key = jrandom.split(key)
+                # action = env.action_space().sample(_key)
+                action = jnp.zeros(1,)
+                # action = jnp.ones(1,)
+
+                key, _key = jrandom.split(key)
+                nobs, delta_obs, nstate, reward, done, _ = env.step(action, state, _key)
+
+                return (nobs, nstate, key), state
+
+
             _, traj_state = jax.lax.scan(_step, (obs, state, key), None, time_steps)
         env.render_traj(traj_state)
 
