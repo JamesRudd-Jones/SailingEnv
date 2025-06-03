@@ -96,17 +96,22 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         action = self.action_convert(input_action)
         #
         # rudder_angle = jnp.clip(action, -self.max_rudder_angle, self.max_rudder_angle)
-        sail_angle = jnp.radians(45.0)  # can range between -90 and +90 generally but only needs to be between 0 and 90
-        true_sail_angle = jnp.sign(apparent_wind_angle) * abs(sail_angle)
         # TODO assume that can just change rudder as desired, there is no latency involved
+
+        sail_angle = jnp.radians(45.0)  # can range between -90 and +90 generally but only needs to be between 0 and 90
 
         # # 3) Calc rudder force
         # pressure = (self.water_density / 2) * speed ** 2
         # rudder_force_x = -(((4 * jnp.pi) / self.rudder_stretching) * rudder_angle ** 2) * pressure * self.rudder_blade_area
         # rudder_force_y = 2 * jnp.pi * pressure * self.rudder_blade_area * rudder_angle
 
+        true_sail_angle = jnp.sign(apparent_wind_angle) * abs(sail_angle)
+        aoa_old = apparent_wind_angle - true_sail_angle
+
+        true_sail_angle = sail_angle  # TODO sort the above out at some point, the above is old and just tryna figure it out
+        aoa = -apparent_wind_angle - true_sail_angle
+
         # 4) Calc sail force
-        aoa = apparent_wind_angle - true_sail_angle
         aoa = jax.lax.select(aoa * true_sail_angle < 0, 0.0, aoa)
         # if aoa * true_sail_angle < 0:
         #     aoa = 0
@@ -233,86 +238,6 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                 {"discount": self.discount(new_state)},
                 )
 
-    def polar_curve_tesy(self, angle_to_apparent_wind: float) -> Tuple[float, float]:
-        """
-        Simulated polar curve. Returns (forward_coeff, side_coeff) based on the
-        absolute angle to the apparent wind.
-        angle_to_apparent_wind is in [0, pi].
-
-        This version uses jax.lax.cond with correct operand passing for nested conditions.
-        """
-        # Ensure angle_to_apparent_wind is a scalar.
-        angle = angle_to_apparent_wind
-
-        # Define some key angles in radians
-        CLOSE_HAULED_ANGLE = jnp.pi / 4.0 # 45 degrees (too close to wind)
-        BEAM_REACH_ANGLE = jnp.pi / 2.0 # 90 degrees (best speed)
-
-        # Define the functions for jax.lax.cond
-        # Each function takes one argument, which is the 'operand' passed to cond
-        # In the outermost cond, the operand is 'angle'.
-        # In the inner cond, the operand is also 'angle'.
-
-        def _close_hauled_branch(current_angle): # Receives 'angle' as 'current_angle'
-            forward = jnp.array(0.0)
-            side = jnp.cos(current_angle) * 0.7
-            return forward, side
-
-        def _not_close_hauled_branch(current_angle): # Receives 'angle' as 'current_angle'
-            # This branch contains another jax.lax.cond
-            def _beam_reach_sub_branch(inner_angle): # Receives 'current_angle' as 'inner_angle'
-                forward = jnp.sin(inner_angle * 2) * 0.8
-                side = (1 - jnp.sin(inner_angle * 2)) * 0.3
-                return forward, side
-
-            def _running_sub_branch(inner_angle): # Receives 'current_angle' as 'inner_angle'
-                forward = jnp.sin(inner_angle) * 0.5
-                side = jnp.array(0.1)
-                return forward, side
-
-            return jax.lax.cond(
-                current_angle < BEAM_REACH_ANGLE, # Condition for inner branch
-                _beam_reach_sub_branch,           # Function if true
-                _running_sub_branch,              # Function if false
-                current_angle                     # OPERAND PASSED TO INNER FUNCTIONS
-            )
-
-        forward_coeff, side_coeff = jax.lax.cond(
-            angle < CLOSE_HAULED_ANGLE, # Condition for outer branch
-            _close_hauled_branch,       # Function if true
-            _not_close_hauled_branch,   # Function if false
-            angle                       # OPERAND PASSED TO OUTER FUNCTIONS
-        )
-
-        return forward_coeff, side_coeff
-
-    @staticmethod
-    def polar_curve(theta):
-        def vel(theta, theta_0=0, theta_dead=jnp.pi / 12):
-            return 1 - jnp.exp(-(theta - theta_0) ** 2 / theta_dead)
-
-        def rew(theta, theta_0=0, theta_dead=jnp.pi / 12):
-            return vel(theta, theta_0, theta_dead) * jnp.cos(theta)
-
-        def line_2(theta):
-            return theta / (theta + 1) * 1.64
-
-        def line_3(theta):
-            return theta / (theta - 0.2) * 0.975
-
-        def line_4(theta):
-            return theta / (theta - 0.8) * 0.704
-
-        boundaries = jnp.array([0, 7 * jnp.pi / 36, 5 * jnp.pi / 8, 3 * jnp.pi / 4, jnp.pi])
-        functions = [rew, line_2, line_3, line_4]
-
-        mask = (theta >= boundaries[:-1]) & (theta < boundaries[1:])
-
-        result = jnp.sum(jnp.stack([jnp.where(mask, f(theta), 0) for mask, f in zip(mask, functions)]), axis=0)
-        result = jnp.where(theta == boundaries[-1], functions[-1](theta), result)
-
-        return result
-
     @staticmethod
     def vector_decomp(magnitude, angle):
         return magnitude * jnp.array((jnp.sin(angle), jnp.cos(angle)))
@@ -342,8 +267,8 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
     def reset_env(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
         # init_state = jrandom.uniform(key, minval=-0.05, maxval=0.05, shape=(4,))
         init_pos = jnp.array(((self.screen_width/2,), (25,)))
-        init_dir = jnp.radians(jnp.ones(1,) * 270)
-        init_boat_vel = jnp.array((0.0, 0.0))
+        init_dir = jnp.radians(jnp.ones(1,) * 90)
+        init_boat_vel = jnp.array((1.0, 0.0))
         state = EnvState(boat_pos=init_pos.squeeze(),
                          boat_vel=init_boat_vel.squeeze(),
                          boat_heading=init_dir.squeeze(),

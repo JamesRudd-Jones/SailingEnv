@@ -12,7 +12,9 @@ dependencies = [
                 "chex>=0.1.89",
                 "distrax>=0.1.5",
                 "flax>=0.10.6",
+                "bifurcagym @ git+ssh://git@github.com/JamesRudd-Jones/BifurcaGym.git@main",
                 ]
+
 requires-python = "==3.10.*"
 readme = "README.md"
 license = {text = "MIT"}
