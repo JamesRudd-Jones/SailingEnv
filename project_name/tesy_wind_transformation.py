@@ -17,3 +17,8 @@ plt.xlim(-screen_size, screen_size)
 plt.ylim(-screen_size, screen_size)
 plt.legend()
 plt.show()
+
+
+"https://www.sailingworld.com/how-to/angles-of-attack/"
+
+"https://tuprints.ulb.tu-darmstadt.de/8471/7/sailboat_model_irsc.pdf"
