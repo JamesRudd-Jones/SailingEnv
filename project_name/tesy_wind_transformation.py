@@ -86,7 +86,8 @@ def get_angle_plot_2(line1, line2, boat_heading, aw_angle, sail_angle, aoa):
     theta1 = theta0 + jnp.copysign(jnp.degrees(sail_angle), aw_angle) - 180
     # theta_inter = jnp.sign(aoa) * jnp.sign(aw_angle) * angle_degrees
     theta_inter = jnp.copysign(jnp.copysign(angle_degrees, aw_angle), aoa)
-    theta2 = 180  # theta1 + theta_inter
+    theta2 = theta1 - theta_inter if boat_heading >= jnp.radians(180.0) else theta1 + theta_inter
+    # TODO a dodgy fix for now
 
     return Arc(intersection, width=4, height=4, angle=0, theta1=min(theta1, theta2), theta2=max(theta1, theta2), color='orange', linewidth=2,
                linestyle='-', label="%0.2f"%float(jnp.degrees(aoa))+u"\u00b0")
@@ -118,7 +119,7 @@ wind_dir: float = 180.0  # deg
 wind_speed: float = 5.0  # in ms^-1
 wind_vel: jnp.ndarray = wind_speed * jnp.array((jnp.sin(jnp.radians(wind_dir)),
                                                                   jnp.cos(jnp.radians(wind_dir))))  # in ms^-1
-init_dir = jnp.radians(jnp.ones(1,) * 180)
+init_dir = jnp.radians(jnp.ones(1,) * 200)
 init_boat_vel = jnp.array((1.0, 0.0))
 
 sail_angle = jnp.radians(45.0)  # between 0 and 90

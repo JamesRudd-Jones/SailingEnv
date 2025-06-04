@@ -44,18 +44,13 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         self.rudder_blade_area = 0.13  # [m^2]
         self.air_density =  1.3 # [kg/m^3]
         self.air_viscosity = 0.0000171 # [Pa * s]
-
         self.sail_length = 1 # [m]
         self.sail_stretching = 0.961
-        self.sail_area = 6.2 # [m^2]
-
+        self.sail_area = 6.2 # [m]
         self.water_viscosity = 0.0000001 # [Pa *
-
         self.keel_length = 2 # [m]
         self.keel_stretching = 0.605
-        self.centreboard_area = 2.0  # [m^2]
         self.lateral_area = 2.5 # [m^2]
-
         self.hull_speed = 2.5
         self.distance_cog_rudder = 1.24 # [m]
         self.distance_cog_sail_pressure_point = 0.24 # [m]
@@ -86,7 +81,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                  key: chex.PRNGKey,
                  ) -> Tuple[chex.Array, chex.Array, EnvState, chex.Array, chex.Array, Dict[Any, Any]]:
         # 1) Get important values
-        boat_speed = jnp.sqrt(state.boat_vel[0] ** 2 + state.boat_vel[1] ** 2)
+        speed = jnp.sqrt(state.boat_vel[0] ** 2 + state.boat_vel[1] ** 2)
 
         transformed_wind = self.global_to_boat(state.boat_heading, self.wind_vel)
 
@@ -127,28 +122,75 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         # elif aoa > jnp.pi / 2:
         #     eff_aoa = -jnp.pi + aoa
 
-        coeff_lift = 1.5 * jnp.sin(2 * eff_aoa)
-        coeff_drag = 0.05 + 0.04 * coeff_lift ** 2
+        pressure = (self.air_density / 2) * apparent_wind_speed ** 2 * jnp.cos(jnp.cos(true_sail_angle)) ** 2
+        # TODO is this correct true sail angle
 
-        sail_lift = 0.5 * self.air_density * apparent_wind_speed ** 2 * self.sail_area * coeff_lift
-        sail_drag = 0.5 * self.air_density * apparent_wind_speed ** 2 * self.sail_area * coeff_drag
+        aero_friction = jax.lax.select(apparent_wind_speed != 0,
+                                       3.55 * jnp.sqrt(self.air_viscosity / (apparent_wind_speed * self.sail_length)),
+                                       0.0)
+        # TODO again check this what it does
 
-        sail_force = self.boat_to_global(apparent_wind_angle, jnp.array((sail_lift, sail_drag)))
-        # TODO unsure if boat to global or global to boat
+        # # # With separation ##########################################################################################
+        # separation = 1 - jnp.exp(-((abs(eff_aoa)) / (jnp.pi / 180 * 25)) ** 2)
+        #
+        # coeff_lift = 2 * jnp.pi * eff_aoa
+        # coeff_drag = aero_friction + (4 * jnp.pi * eff_aoa ** 2 * separation) / self.sail_stretching
+        #
+        # propulsion = pressure * self.sail_area * (coeff_lift * jnp.sin(apparent_wind_angle) - coeff_drag * jnp.cos(apparent_wind_angle))
+        # transverse_force = pressure * self.sail_area * (-coeff_lift * jnp.cos(apparent_wind_angle) - coeff_drag * jnp.sin(apparent_wind_angle))
+        #
+        # separated_propulsion = jnp.sign(aoa) * pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.sin(true_sail_angle)
+        # separated_transverse_force = -jnp.sign(aoa) * pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.cos(true_sail_angle)
+        #
+        # sail_force_x = (1 - separation) * propulsion + separation * separated_propulsion
+        # sail_force_y = (1 - separation) * transverse_force + separation * separated_transverse_force
+        ################################################################################################################
 
-        # sail_moment = sail_force[0]  # TODO need this
+        # # # Without separation #######################################################################################
+        coeff_lift = 2 * jnp.pi * eff_aoa
+        coeff_drag = aero_friction + coeff_lift ** 2 / (jnp.pi * self.sail_stretching)
 
-        coeff_lift = 1.2 * jnp.sin(2 * eff_aoa)
-        coeff_drag = 0.02 + 0.03 * coeff_lift ** 2
+        propulsion = pressure * self.sail_area * (jnp.sin(apparent_wind_angle) * coeff_lift - jnp.cos(apparent_wind_angle) * coeff_drag)
+        transverse_force = pressure * self.sail_area * -(jnp.sin(apparent_wind_angle) * coeff_drag + jnp.cos(apparent_wind_angle) * coeff_lift)
+        # TODO is apparent wind angle correct here
 
-        centreboard_lift = 0.5 * self.water_density * boat_speed ** 2 * self.centreboard_area * coeff_lift
-        centreboard_drag = 0.5 * self.water_density * boat_speed ** 2 * self.centreboard_area * coeff_drag
+        sail_force_x = propulsion
+        sail_force_y = transverse_force
+        ################################################################################################################
 
-        leeway_angle = jnp.arctan2(state.boat_vel[1], state.boat_vel[0])
+        # 5) Calculate lateral force
+        hydro_friction = jax.lax.select(speed != 0,
+                                        2.66 * jnp.sqrt(self.water_viscosity / (speed * self.keel_length)),
+                                        0.0)
 
-        centreboard_force_x = -centreboard_drag * jnp.cos(leeway_angle) - centreboard_lift * jnp.sin(leeway_angle)
-        centreboard_force_y = -centreboard_lift * jnp.cos(leeway_angle) + centreboard_drag * jnp.sin(leeway_angle)
-        centreboard_force = jnp.array((centreboard_force_x, centreboard_force_y))
+        #     aoa :           angle of attack
+        # eff_aoa : effective angle of attack
+        eff_aoa = aoa = jnp.arctan2(state.boat_vel[1], state.boat_vel[0])
+        eff_aoa = jnp.where(aoa < -jnp.pi / 2, jnp.pi + aoa, eff_aoa)
+        eff_aoa = jnp.where(aoa > jnp.pi / 2, -jnp.pi + aoa, eff_aoa)
+        # TODO is the above correct hmmm
+        # if aoa < -jnp.pi / 2:
+        #     eff_aoa = jnp.pi + aoa
+        # elif aoa > jnp.pi / 2:
+        #     eff_aoa = -jnp.pi + aoa
+
+        lateral_separation = 1 - jnp.exp(-((abs(eff_aoa)) / (jnp.pi / 180 * 25)) ** 2)
+
+        # Identical calculation for x and y
+        tmp = -(hydro_friction + (4 * jnp.pi * eff_aoa ** 2 * lateral_separation) / self.keel_stretching)
+
+        separated_transverse_force = -jnp.sign(aoa) * pressure * self.sail_area * jnp.sin(aoa) ** 2
+
+        lateral_force_x = (1 - lateral_separation) * (tmp * jnp.cos(aoa) + 2 * jnp.pi * eff_aoa * jnp.sin(aoa)) * pressure * self.lateral_area
+        lateral_force_y = (1 - lateral_separation) * (tmp * jnp.sin(aoa) - 2 * jnp.pi * eff_aoa * jnp.cos(aoa)) * pressure * self.lateral_area + lateral_separation * separated_transverse_force
+
+        # # 6) Calc damping
+        # damping_x = self.damping_invariant_x * state.boat_vel[0]
+        # damping_y = self.damping_invariant_y * state.boat_vel[1]
+        # damping_yaw = self.damping_invariant_yaw * state.boat_heading_rate
+        #
+        # # 7) Calc wave impedance
+        # wave_impedance = -jnp.sign(state.boat_vel[0]) * speed**2 * (speed / self.hull_speed)**2 * self.wave_impedance_invariant
 
         delta_pos_x = state.boat_vel[0] * jnp.sin(state.boat_heading) - state.boat_vel[1] * jnp.cos(state.boat_heading)
         delta_pos_y = state.boat_vel[1] * jnp.sin(state.boat_heading) + state.boat_vel[0] * jnp.cos(state.boat_heading)
@@ -157,9 +199,9 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         delta_yaw = state.boat_heading_rate  # * jnp.sin(roll) + pitch_rate * jnp.cos(roll)
 
         # delta_vel_x = delta_yaw * state.boat_vel[1] + (sail_force_x + lateral_force_x + rudder_force_x + damping_x + wave_impedance) / self.mass
-        delta_vel_x = delta_yaw * state.boat_vel[1] + (sail_force[0] + centreboard_force[0]) / self.mass
+        delta_vel_x = delta_yaw * state.boat_vel[1] + (sail_force_x + lateral_force_x) / self.mass
         # delta_vel_y = -delta_yaw * state.boat_vel[0] + ((sail_force_y + lateral_force_y + rudder_force_y) + damping_y) / self.mass
-        delta_vel_y = -delta_yaw * state.boat_vel[0] + (sail_force[1] + centreboard_force[1]) / self.mass
+        delta_vel_y = -delta_yaw * state.boat_vel[0] + (sail_force_y + lateral_force_y) / self.mass
 
         # delta_yaw_rate = (damping_yaw
         #                   # + hydrostatic_force.z * hydrostatic_force.x * jnp.cos(roll)
@@ -421,7 +463,7 @@ if __name__ == '__main__':
             key, _key = jrandom.split(key)
             obs, state = env.reset(_key)
 
-            time_steps = 100#0#0#0
+            time_steps = 80#0#0#0
 
             def _step(runner_state, unused):
                 obs, state, key = runner_state
