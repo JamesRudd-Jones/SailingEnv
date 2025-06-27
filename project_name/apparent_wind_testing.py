@@ -36,7 +36,7 @@ plt.arrow(5, 10, apparent_wind_x, -apparent_wind_y, width=0.1, color="Blue", lab
 plt.xlim(0, 10)
 plt.ylim(0, 10)
 plt.legend()
-# plt.show()
+plt.show()
 
 print(f"True Wind Angle = {wind_dir}")
 print(f"Apparent Wind Angle = {jnp.degrees(apparent_wind_angle)}")
