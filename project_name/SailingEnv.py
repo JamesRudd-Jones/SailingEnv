@@ -19,7 +19,6 @@ class EnvState(base_env.EnvState):
 
 class SailingEnvCSCA(base_env.BaseEnvironment):
     """
-    0 degrees is the top of the screen or defined as north
     wind x y is global
     boat has a local x y
     """
@@ -129,6 +128,8 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
         sail_force_x = -sail_drag * jnp.cos(apparent_wind_angle) + sail_lift * jnp.sin(apparent_wind_angle)
         sail_force_y = -sail_lift * jnp.cos(apparent_wind_angle) - sail_drag * jnp.sin(apparent_wind_angle)
+        # sail_force_x = 0
+        # sail_force_y = 0
 
         # Calc centreboard force
         boat_speed = jnp.sqrt(state.boat_vel[0] ** 2 + state.boat_vel[1] ** 2)
@@ -146,8 +147,10 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         centreboard_lift = 0.5 * self.water_density * boat_speed ** 2 * self.centreboard_area * coeff_lift
         centreboard_drag = 0.5 * self.water_density * boat_speed ** 2 * self.centreboard_area * coeff_drag
 
-        centreboard_force_x = -centreboard_drag * jnp.cos(leeway_angle) + centreboard_lift * jnp.sin(leeway_angle)
-        centreboard_force_y = -centreboard_lift * jnp.cos(leeway_angle) - centreboard_drag * jnp.sin(leeway_angle)
+        # centreboard_force_x = -centreboard_drag * jnp.cos(leeway_angle) + centreboard_lift * jnp.sin(leeway_angle)
+        # centreboard_force_y = -centreboard_lift * jnp.cos(leeway_angle) - centreboard_drag * jnp.sin(leeway_angle)
+        centreboard_force_x = 0.0
+        centreboard_force_y = 0.0
 
         global_x = state.boat_vel[0] * jnp.cos(state.boat_heading) - state.boat_vel[1] * jnp.sin(state.boat_heading)
         global_y = state.boat_vel[1] * jnp.cos(state.boat_heading) + state.boat_vel[0] * jnp.sin(state.boat_heading)
@@ -468,6 +471,8 @@ class SailingEnvCSDA(SailingEnvCSCA):
         return spaces.Discrete(len(self.action_array))
 
 if __name__ == '__main__':
+    print(jax.extend.backend.get_backend().platform)
+
     with jax.disable_jit(disable=False):
         key = jrandom.PRNGKey(42)
 
