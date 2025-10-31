@@ -1,3 +1,8 @@
+"""
+Based off the following: https://github.com/simonkohaut/stda-sailboat-simulator/blob/master/src/simulation.py
+"""
+
+
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -141,10 +146,10 @@ wind_dir: float = 0.0  # deg
 wind_speed: float = 5.0  # in ms^-1
 wind_vel: jnp.ndarray = -wind_speed * jnp.array((jnp.cos(jnp.radians(wind_dir)),
                                                  jnp.sin(jnp.radians(wind_dir))))  # in ms^-1
-init_dir = jnp.radians(jnp.ones(1,) * 90)
+init_dir = jnp.radians(jnp.ones(1,) * 30)
 init_boat_vel = jnp.array((1.0, 0.0))
 
-sail_angle = jnp.radians(30.0)  # between 0 and 90
+sail_angle = jnp.radians(0.0)  # between 0 and 90
 
 def boat_to_global(boat_heading, val):
     delta_pos_x = val[0] * jnp.cos(boat_heading) - val[1] * jnp.sin(boat_heading)
@@ -165,8 +170,8 @@ def apparent_wind(boat_heading, boat_vel, wind_vel):
 
     return apparent_wind, apparent_wind_speed, apparent_wind_angle
 
-def get_sail_angle_plot(boat_dir, sail_angle, apparent_wind_angle):
-    true_sail_angle = jnp.copysign(sail_angle, apparent_wind_angle)  # prevents sign of 0 when AWA == 0
+def get_sail_angle_plot(boat_dir, sail_angle, apparent_wind_angle): # prevents sign of 0 when AWA == 0
+    true_sail_angle = jnp.sign(apparent_wind_angle) * jnp.abs(sail_angle) # prevents sign of 0 when AWA == 0
 
     new_angle_rad = boat_dir + jnp.pi + true_sail_angle
 
@@ -194,15 +199,16 @@ def calc_sail_forces(true_sail_angle, aoa, apparent_wind_speed, apparent_wind_an
     #     aoa = 0
 
     eff_aoa = aoa  # eff_aoa : effective angle of attack
-    # eff_aoa = jnp.where(aoa < -jnp.pi / 2, jnp.pi + aoa, eff_aoa)
-    # eff_aoa = jnp.where(aoa > jnp.pi / 2, -jnp.pi + aoa, eff_aoa)
-    # if aoa < -jnp.pi / 2:
-    #     eff_aoa = jnp.pi + aoa
-    # elif aoa > jnp.pi / 2:
-    #     eff_aoa = -jnp.pi + aoa
+    eff_aoa = jnp.where(aoa < -jnp.pi / 2, jnp.pi + aoa, eff_aoa)
+    eff_aoa = jnp.where(aoa > jnp.pi / 2, -jnp.pi + aoa, eff_aoa)
+    # # if aoa < -jnp.pi / 2:
+    # #     eff_aoa = jnp.pi + aoa
+    # # elif aoa > jnp.pi / 2:
+    # #     eff_aoa = -jnp.pi + aoa
+    # TODO sort out the eff_aoa code
 
     aero_friction = jax.lax.select(apparent_wind_speed != 0,
-                                   3.55 * jnp.sqrt(air_kinematic_viscosity / (apparent_wind_speed * sail_span)),
+                                   2.66 / jnp.sqrt((apparent_wind_speed * sail_chord) / air_kinematic_viscosity),
                                    0.0)
 
     coeff_lift = (2 * jnp.pi * eff_aoa) / (1 + 2 / sail_aspect_ratio)
@@ -210,36 +216,24 @@ def calc_sail_forces(true_sail_angle, aoa, apparent_wind_speed, apparent_wind_an
 
     print(f"AoA : {aoa}, Eff AoA : {eff_aoa}, Coeff of Lift : {coeff_lift}")
 
-    sail_lift = 0.5 * air_density * apparent_wind_speed ** 2 * sail_area * coeff_lift
-    sail_drag = 0.5 * air_density * apparent_wind_speed ** 2 * sail_area * coeff_drag
+    pressure = 0.5 * air_density * apparent_wind_speed ** 2
+    sail_lift = pressure * sail_area * coeff_lift
+    sail_drag = pressure * sail_area * coeff_drag
 
     print(f"Sail Lift : {sail_lift}, Sail Drag : {sail_drag}")
 
     sail_force_x = -sail_drag * jnp.cos(apparent_wind_angle) + sail_lift * jnp.sin(apparent_wind_angle)
-    sail_force_y = sail_lift * jnp.cos(apparent_wind_angle) + sail_drag * jnp.sin(apparent_wind_angle)
+    sail_force_y = -sail_lift * jnp.cos(apparent_wind_angle) - sail_drag * jnp.sin(apparent_wind_angle)
 
-    return jnp.array((sail_force_x, sail_force_y))
+    separation = 1 - jnp.exp(-(abs(eff_aoa) / (jnp.radians(25))) ** 2)
 
-    # pressure = (air_density / 2) * apparent_wind_speed ** 2 * jnp.cos(jnp.cos(sail_angle)) ** 2
-    #
-    # friction = 3.55 * jnp.sqrt(air_kinematic_viscosity / (apparent_wind_speed * SAIL_LENGTH)) if apparent_wind_speed != 0 else 0
-    #
-    # separation = 1 - jnp.exp(-((abs(eff_aoa)) / (jnp.pi / 180 * 25)) ** 2)
-    #
-    # propulsion = (2 * jnp.pi * eff_aoa * jnp.sin(wind.angle) \
-    #               - (friction + (4 * pi * eff_aoa ** 2 * separation) / SAIL_STRETCHING) * cos(wind.angle)) \
-    #              * SAIL_AREA * pressure
-    #
-    # transverse_force = (-2 * pi * eff_aoa * cos(wind.angle) \
-    #                     - (friction + (4 * pi * eff_aoa ** 2 * separation) / SAIL_STRETCHING) * sin(wind.angle)) \
-    #                    * SAIL_AREA * pressure
-    #
-    # separated_propulsion = sign(aoa) * pressure * SAIL_AREA * sin(aoa) ** 2 * sin(sail_angle)
-    # separated_transverse_force = -sign(aoa) * pressure * SAIL_AREA * sin(aoa) ** 2 * cos(sail_angle)
-    #
-    # return SailForce(
-    #     x=(1 - separation) * propulsion + separation * separated_propulsion,
-    #     y=(1 - separation) * transverse_force + separation * separated_transverse_force)
+    separated_force_x = jnp.sign(aoa) * pressure * sail_area * jnp.sin(aoa) ** 2 * jnp.sin(true_sail_angle)
+    separated_force_y = -jnp.sign(aoa) * pressure * sail_area * jnp.sin(aoa) ** 2 * jnp.cos(true_sail_angle)
+
+    x = (1 - separation) * sail_force_x + separation * separated_force_x
+    y = (1 - separation) * sail_force_y + separation * separated_force_y
+
+    return jnp.array((x, y))
 
 def calc_centreboard_forces(boat_vel):
     water_kinematic_viscosity = 0.0000001  # [Pa * s]
@@ -256,20 +250,22 @@ def calc_centreboard_forces(boat_vel):
     eff_leeway_angle = jnp.where(leeway_angle > jnp.pi / 2, -jnp.pi + leeway_angle, eff_leeway_angle)
 
     hydro_friction = jax.lax.select(boat_speed != 0,
-                                    2.66 * jnp.sqrt(water_kinematic_viscosity) / (
-                                                boat_speed * centreboard_span),
+                                    2.66 / jnp.sqrt((boat_speed * centreboard_chord) / water_kinematic_viscosity),
                                     0.0)
 
     coeff_lift = (2 * jnp.pi * eff_leeway_angle) / (1 + 2 / centreboard_aspect_ratio)
     coeff_drag = hydro_friction * coeff_lift ** 2
 
-    centreboard_lift = 0.5 * water_density * boat_speed ** 2 * centreboard_area * coeff_lift
-    centreboard_drag = 0.5 * water_density * boat_speed ** 2 * centreboard_area * coeff_drag
+    pressure = 0.5 * water_density * boat_speed ** 2
+    centreboard_lift = pressure * centreboard_area * coeff_lift
+    centreboard_drag = pressure * centreboard_area * coeff_drag
 
     centreboard_force_x = -centreboard_drag * jnp.cos(leeway_angle) + centreboard_lift * jnp.sin(leeway_angle)
     centreboard_force_y = -centreboard_lift * jnp.cos(leeway_angle) - centreboard_drag * jnp.sin(leeway_angle)
     # centreboard_force_x = 0.0
     # centreboard_force_y = 0.0
+
+    separation = 1 - jnp.exp(-(abs(eff_leeway_angle) / (jnp.radians(25))) ** 2)
 
     return jnp.array((centreboard_force_x, centreboard_force_y))
 
@@ -305,7 +301,7 @@ ax.arrow(-float(aw[0]) * wind_scaler, -float(aw[1]) * wind_scaler, float(aw[0]),
 plt.plot([0, sail[0]], [0, sail[1]], color="black", label="Sail", zorder=1)
 # plt.axline([0, 0], [sail[0], sail[1]], linestyle='--', color="black", zorder=1)
 
-sail_force_plot_scaler = 0.02
+sail_force_plot_scaler = 0.1
 ax.arrow(0, 0, float(sail_force_global_x[0]) * sail_force_plot_scaler, float(sail_force_global_x[1]) * sail_force_plot_scaler, label="Sail Force X", head_width=0.4, color="purple")
 ax.arrow(0, 0, float(sail_force_global_y[0]) * sail_force_plot_scaler, float(sail_force_global_y[1]) * sail_force_plot_scaler, label="Sail Force Y", head_width=0.4, color="pink")
 
