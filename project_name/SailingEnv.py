@@ -38,7 +38,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         self.mass: float = 120.0  # in kg
         self.max_rudder_angle = jnp.radians(45.0)
 
-        self.rudder_stretching = 2.326923076923077
+        self.rudder_stretching = 2.326923076923077  # TODO aka aspect ratio
         self.rudder_blade_area = 0.13  # [m^2]
 
         self.air_kinematic_viscosity = 0.0000171  # [Pa * s]
@@ -52,10 +52,10 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         self.water_kinematic_viscosity = 0.0000001 # [Pa * s]
         self.water_density = 1000  # [kg/m^3]
 
-        self.centreboard_area = 0.5  # [m^2]
-        self.centreboard_chord = 0.5  # [m]
-        self.centreboard_span = self.centreboard_area / self.centreboard_chord  # [m]
-        self.centreboard_aspect_ratio = self.centreboard_span / self.centreboard_chord
+        self.cboard_area = 0.5  # [m^2]
+        self.cboard_chord = 0.5  # [m]
+        self.cboard_span = self.cboard_area / self.cboard_chord  # [m]
+        self.cboard_aspect_ratio = self.cboard_span / self.cboard_chord
         self.lateral_area = 2.5 # [m^2]
 
         self.hull_speed = 2.5
@@ -89,47 +89,46 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                  ) -> Tuple[chex.Array, chex.Array, EnvState, chex.Array, chex.Array, Dict[Any, Any]]:
         # Adjust and apply actions
         action = self.action_convert(input_action)
-        sail_angle = jnp.radians(30.0)  # can range between 0 and 90
+        sail_angle = jnp.radians(10.0)  # can range between 0 and 90
 
         # Convert wind to boat and find apparent wind
-        true_wind_to_boat_x = self.wind_vel[0] * jnp.cos(state.boat_heading) - self.wind_vel[1] * jnp.sin(state.boat_heading)
-        true_wind_to_boat_y = self.wind_vel[1] * jnp.cos(state.boat_heading) - self.wind_vel[0] * jnp.sin(state.boat_heading)
-        transformed_wind = jnp.array((true_wind_to_boat_x, true_wind_to_boat_y))
+        transformed_wind = self.global_to_boat(state.boat_heading, self.wind_vel)
         apparent_wind = transformed_wind - state.boat_vel
         apparent_wind_angle = jnp.arctan2(-apparent_wind[1], -apparent_wind[0])
         apparent_wind_speed = jnp.sqrt(apparent_wind[0] ** 2 + apparent_wind[1] ** 2)
 
         # Calc aoa
-        true_sail_angle = jnp.copysign(sail_angle, apparent_wind_angle)  # prevents sign of 0 when AWA == 0
+        true_sail_angle = jnp.sign(apparent_wind_angle) * jnp.abs(sail_angle)  # prevents sign of 0 when AWA == 0
         aoa = apparent_wind_angle - true_sail_angle
 
         # Calc sail force
         aoa = jax.lax.select(aoa * true_sail_angle < 0, 0.0, aoa)
-        # if aoa * true_sail_angle < 0:
-        #     aoa = 0
 
         eff_aoa = aoa  # eff_aoa : effective angle of attack
         eff_aoa = jnp.where(aoa < -jnp.pi / 2, jnp.pi + aoa, eff_aoa)
         eff_aoa = jnp.where(aoa > jnp.pi / 2, -jnp.pi + aoa, eff_aoa)
-        # if aoa < -jnp.pi / 2:
-        #     eff_aoa = jnp.pi + aoa
-        # elif aoa > jnp.pi / 2:
-        #     eff_aoa = -jnp.pi + aoa
 
         aero_friction = jax.lax.select(apparent_wind_speed != 0,
-                                       3.55 * jnp.sqrt(self.air_kinematic_viscosity / (apparent_wind_speed * self.sail_span)),
+                                       2.66 / jnp.sqrt((apparent_wind_speed * self.sail_chord) / self.air_kinematic_viscosity),
                                        0.0)
 
         coeff_lift = (2 * jnp.pi * eff_aoa) / (1 + 2 / self.sail_aspect_ratio)
         coeff_drag = aero_friction * coeff_lift ** 2
 
-        sail_lift = 0.5 * self.air_density * apparent_wind_speed ** 2 * self.sail_area * coeff_lift
-        sail_drag = 0.5 * self.air_density * apparent_wind_speed ** 2 * self.sail_area * coeff_drag
+        aero_pressure = 0.5 * self.air_density * apparent_wind_speed ** 2
+        sail_lift = aero_pressure * self.sail_area * coeff_lift
+        sail_drag = aero_pressure * self.sail_area * coeff_drag
 
         sail_force_x = -sail_drag * jnp.cos(apparent_wind_angle) + sail_lift * jnp.sin(apparent_wind_angle)
         sail_force_y = -sail_lift * jnp.cos(apparent_wind_angle) - sail_drag * jnp.sin(apparent_wind_angle)
-        # sail_force_x = 0
-        # sail_force_y = 0
+
+        aero_separation = 1 - jnp.exp(-(abs(eff_aoa) / (jnp.radians(25))) ** 2)
+
+        sail_separated_force_x = jnp.sign(aoa) * aero_pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.sin(true_sail_angle)
+        sail_separated_force_y = -jnp.sign(aoa) * aero_pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.cos(true_sail_angle)
+
+        sail_x = (1 - aero_separation) * sail_force_x + aero_separation * sail_separated_force_x
+        sail_y = (1 - aero_separation) * sail_force_y + aero_separation * sail_separated_force_y
 
         # Calc centreboard force
         boat_speed = jnp.sqrt(state.boat_vel[0] ** 2 + state.boat_vel[1] ** 2)
@@ -138,23 +137,25 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         eff_leeway_angle = jnp.where(leeway_angle > jnp.pi / 2, -jnp.pi + leeway_angle, eff_leeway_angle)
 
         hydro_friction = jax.lax.select(boat_speed != 0,
-                                        2.66 * jnp.sqrt(self.water_kinematic_viscosity) / (boat_speed * self.centreboard_span),
+                                        2.66 / jnp.sqrt((boat_speed * self.cboard_chord) / self.water_kinematic_viscosity),
                                         0.0)
 
-        coeff_lift = (2 * jnp.pi * eff_leeway_angle) / (1 + 2 / self.centreboard_aspect_ratio)
+        coeff_lift = (2 * jnp.pi * eff_leeway_angle) / (1 + 2 / self.cboard_aspect_ratio)
         coeff_drag = hydro_friction * coeff_lift ** 2
 
-        centreboard_lift = 0.5 * self.water_density * boat_speed ** 2 * self.centreboard_area * coeff_lift
-        centreboard_drag = 0.5 * self.water_density * boat_speed ** 2 * self.centreboard_area * coeff_drag
+        hydro_pressure = 0.5 * self.water_density * boat_speed ** 2
+        cboard_lift = hydro_pressure * self.cboard_area * coeff_lift
+        cboard_drag = hydro_pressure * self.cboard_area * coeff_drag
 
-        # centreboard_force_x = -centreboard_drag * jnp.cos(leeway_angle) + centreboard_lift * jnp.sin(leeway_angle)
-        # centreboard_force_y = -centreboard_lift * jnp.cos(leeway_angle) - centreboard_drag * jnp.sin(leeway_angle)
-        centreboard_force_x = 0.0
-        centreboard_force_y = 0.0
+        cboard_force_x = -cboard_drag * jnp.cos(leeway_angle) - cboard_lift * jnp.sin(leeway_angle)
+        cboard_force_y = -cboard_lift * jnp.cos(leeway_angle) - cboard_drag * jnp.sin(leeway_angle)
 
-        global_x = state.boat_vel[0] * jnp.cos(state.boat_heading) - state.boat_vel[1] * jnp.sin(state.boat_heading)
-        global_y = state.boat_vel[1] * jnp.cos(state.boat_heading) + state.boat_vel[0] * jnp.sin(state.boat_heading)
-        delta_pos = jnp.array((global_x, global_y))
+        hydro_separation = 1 - jnp.exp(-(abs(eff_leeway_angle) / (jnp.radians(25))) ** 2)
+
+        cboard_separated_force_y = -jnp.sign(leeway_angle) * hydro_pressure * self.cboard_area * jnp.sin(leeway_angle) ** 2
+
+        cboard_x = (1 - hydro_separation) * cboard_force_x
+        cboard_y = (1 - hydro_separation) * cboard_force_y + hydro_separation * cboard_separated_force_y
 
         # Calc damping
         damping_x = self.damping_invariant_x * state.boat_vel[0]
@@ -165,8 +166,10 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         wave_impedance = jnp.zeros(())  # -jnp.sign(state.boat_vel[0]) * boat_speed ** 2 * (boat_speed / self.hull_speed) ** 2 * self.wave_impedance_invariant
 
         # Sum up forces and turn to velocities
-        delta_vel_x = (sail_force_x + centreboard_force_x + damping_x + wave_impedance) / self.mass
-        delta_vel_y = (sail_force_y + centreboard_force_y + damping_y) / self.mass
+        delta_vel_x = (sail_x + cboard_x + damping_x + wave_impedance) / self.mass
+        delta_vel_y = (sail_y + cboard_y + damping_y) / self.mass
+
+        delta_pos = self.boat_to_global(state.boat_heading, state.boat_vel)
 
         # 8) Apply differential step
         new_boat_pos = state.boat_pos + delta_pos * self.dt
@@ -191,10 +194,10 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
         info = {"discount": self.discount(new_state),
                 "sail_angle": true_sail_angle,
-                "sail_force_x": sail_force_x,
-                "sail_force_y": sail_force_y,
-                "centreboard_force_x": centreboard_force_x,
-                "centreboard_force_y": centreboard_force_y,
+                "sail_force_x": sail_x,
+                "sail_force_y": sail_y,
+                "centreboard_force_x": cboard_x,
+                "centreboard_force_y": cboard_y,
                 }
 
         return (jax.lax.stop_gradient(self.get_obs(new_state)),
@@ -209,14 +212,12 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
     def boat_to_global(boat_heading, boat_val):
         global_x = boat_val[0] * jnp.cos(boat_heading) - boat_val[1] * jnp.sin(boat_heading)
         global_y = boat_val[1] * jnp.cos(boat_heading) + boat_val[0] * jnp.sin(boat_heading)
-
         return jnp.array((global_x.squeeze(), global_y.squeeze()))
 
     @staticmethod
     def global_to_boat(boat_heading, global_val):
-        boat_x = global_val[0] * jnp.sin(boat_heading) + global_val[1] * jnp.cos(boat_heading)
-        boat_y = global_val[1] * jnp.sin(boat_heading) - global_val[0] * jnp.cos(boat_heading)
-
+        boat_x = global_val[0] * jnp.cos(boat_heading) + global_val[1] * jnp.sin(boat_heading)
+        boat_y = global_val[1] * jnp.cos(boat_heading) - global_val[0] * jnp.sin(boat_heading)
         return jnp.array((boat_x.squeeze(), boat_y.squeeze()))
 
     @staticmethod
@@ -247,7 +248,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         # init_dir = jnp.radians(jnp.ones(()) * 90)
         # init_dir = jnp.radians(jnp.ones(()) * 270)
         # init_dir = jnp.radians(jnp.ones(()) * 45)
-        init_dir = jnp.radians(jnp.ones(()) * 90)
+        init_dir = jnp.radians(jnp.ones(()) * 30)
         init_boat_vel = jnp.array((1.0, 0.0))
         state = EnvState(boat_pos=init_pos.squeeze(),
                          boat_vel=init_boat_vel.squeeze(),
