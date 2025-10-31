@@ -14,6 +14,8 @@ class EnvState(base_env.EnvState):
     boat_vel: jnp.ndarray
     boat_heading: jnp.ndarray
     boat_heading_rate: jnp.ndarray
+    rudder_angle: jnp.ndarray
+    sail_angle: jnp.ndarray
     time: int
 
 
@@ -36,49 +38,54 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                                                                    jnp.sin(jnp.radians(self.wind_dir))))  # in ms^-1
 
         self.mass: float = 120.0  # in kg
-        self.max_rudder_angle = jnp.radians(45.0)
 
-        self.rudder_stretching = 2.326923076923077  # TODO aka aspect ratio
-        self.rudder_blade_area = 0.13  # [m^2]
+        self.rudder_area = 0.13  # [m^2]
+        self.rudder_aspect_ratio = 2.326923076923077  # TODO aka rudder stretching in the paper
+        self.rudder_dist_to_cog = 1.24
+        self.min_rudder = jnp.radians(-35)
+        self.max_rudder = jnp.radians(35)
 
         self.air_kinematic_viscosity = 0.0000171  # [Pa * s]
         self.air_density =  1.3 # [kg/m^3]
 
-        self.sail_area = 6.2 # [m^2]
-        self.sail_chord = 2  # [m]  # TODO sort these values out
-        self.sail_span = self.sail_area / self.sail_chord  # [m]
+        self.sail_area = 6.4 # [m^2]
+        self.sail_chord = 1  # [m]  # TODO sort these values out
+        self.sail_span = 6.2  # [m]
         self.sail_aspect_ratio = self.sail_span / self.sail_chord
+        self.sail_dist_cog_to_pressure_point = 0.43
+        self.sail_dist_mast_to_pressure_point = 0.68
+        self.min_sail = jnp.radians(0)
+        self.max_sail = jnp.radians(90)
 
         self.water_kinematic_viscosity = 0.0000001 # [Pa * s]
         self.water_density = 1000  # [kg/m^3]
 
         self.cboard_area = 0.5  # [m^2]
-        self.cboard_chord = 0.5  # [m]
-        self.cboard_span = self.cboard_area / self.cboard_chord  # [m]
+        self.cboard_chord = 2  # [m]
+        self.cboard_span = 0.55 # [m]
         self.cboard_aspect_ratio = self.cboard_span / self.cboard_chord
-        self.lateral_area = 2.5 # [m^2]
+        self.cboard_dist_cog_to_pressure_point = 0.43
+        self.cboard_dist_cog_to_middle = self.cboard_dist_cog_to_pressure_point - 0.7  # TODO sort all these COG distances out
 
         self.hull_speed = 2.5
-        self.distance_cog_rudder = 1.24 # [m]
-        self.distance_cog_sail_pressure_point = 0.24 # [m]
-        self.distance_mast_sail_pressure_point = 0.68 # [m]
-        self.distance_cog_keel_pressure_point = 0.24 # [m]
-        self.distance_cog_keel_middle = self.distance_cog_keel_pressure_point - .7
+        self.lateral_area = 2.5 # [m^2]
 
         self.along_damping = 15
         self.transverse_damping = 5
-        self.yaw_timeconstant = 5
+        self.heading_time_constant = 5
         self.moi_z = 1066
 
         self.damping_invariant_x = -self.mass / self.along_damping
         self.damping_invariant_y = -self.mass / self.transverse_damping
-        self.damping_invariant_yaw = -(self.moi_z / self.yaw_timeconstant)
+        self.damping_invariant_heading = -(self.moi_z / self.heading_time_constant)
         self.wave_impedance_invariant = (self.water_density / 2) * self.lateral_area
 
         self.screen_width: int = 100 # in m
         self.screen_height: int = 100 # in m
 
-        self.marks: jnp.ndarray = jnp.array(((self.screen_width/2, 80),))
+        self.init_pos: jnp.ndarray = jnp.array((self.screen_width / 4, self.screen_height / 2))
+
+        self.marks: jnp.ndarray = jnp.array(((3 * self.screen_width / 4, self.screen_height / 2),))
         # TODO to deal with multiple marks, could jnp.roll once done a conditional
         # self.reward_gate: jnp.ndarray = jnp.array((10, 10))
 
@@ -89,7 +96,24 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                  ) -> Tuple[chex.Array, chex.Array, EnvState, chex.Array, chex.Array, Dict[Any, Any]]:
         # Adjust and apply actions
         action = self.action_convert(input_action)
-        sail_angle = jnp.radians(10.0)  # can range between 0 and 90
+        # sail_angle = jnp.radians(20.0)  # can range between 0 and 90
+        # rudder_angle = -0.02  # action
+        # rudder_angle = action[0]
+        # sail_angle = action[1]
+
+        delta_rudder = - 2 * (action[0] - state.rudder_angle)
+        max_rudder_speed = jnp.pi / 30
+        # if delta_rudder > max_rudder_speed:
+        # print delta_rudder, max_rudder_speed
+        delta_rudder = jnp.clip(delta_rudder, -max_rudder_speed, max_rudder_speed)
+
+        delta_sail = -0.1 * (action[1] - state.sail_angle)
+        max_sail_speed = jnp.pi / 10
+        delta_sail = jnp.clip(delta_sail, -max_sail_speed, max_sail_speed)
+
+        rudder_angle = jnp.clip(state.rudder_angle + delta_rudder * self.dt, self.min_rudder, self.max_rudder)
+        sail_angle = jnp.clip(state.sail_angle + delta_sail * self.dt, self.min_sail, self.max_sail)
+        # TODO is there a better way to do this?
 
         # Convert wind to boat and find apparent wind
         transformed_wind = self.global_to_boat(state.boat_heading, self.wind_vel)
@@ -157,34 +181,46 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         cboard_x = (1 - hydro_separation) * cboard_force_x
         cboard_y = (1 - hydro_separation) * cboard_force_y + hydro_separation * cboard_separated_force_y
 
+        # Calc rudder force
+        rudder_x = -(((4 * jnp.pi) / self.rudder_aspect_ratio) * rudder_angle ** 2) * hydro_pressure * self.rudder_area
+        rudder_y = 2 * jnp.pi * hydro_pressure * self.rudder_area * rudder_angle
+
         # Calc damping
         damping_x = self.damping_invariant_x * state.boat_vel[0]
         damping_y = self.damping_invariant_y * state.boat_vel[1]
-        # damping_yaw = self.damping_invariant_yaw * state.boat_heading_rate
+        damping_heading = self.damping_invariant_heading * state.boat_heading_rate
 
         # Calc wave impedance
         wave_impedance = jnp.zeros(())  # -jnp.sign(state.boat_vel[0]) * boat_speed ** 2 * (boat_speed / self.hull_speed) ** 2 * self.wave_impedance_invariant
+        # TODO wave impedance seems mega large at the moment
 
         # Sum up forces and turn to velocities
-        delta_vel_x = (sail_x + cboard_x + damping_x + wave_impedance) / self.mass
-        delta_vel_y = (sail_y + cboard_y + damping_y) / self.mass
-
         delta_pos = self.boat_to_global(state.boat_heading, state.boat_vel)
+        delta_heading = state.boat_heading_rate
+
+        # delta_vel_x = (sail_x + cboard_x + rudder_x + damping_x + wave_impedance) / self.mass
+        # delta_vel_y = (sail_y + cboard_y + rudder_y + damping_y) / self.mass
+
+        delta_vel_x = delta_heading * state.boat_vel[1] + (sail_x + cboard_x + rudder_x + damping_x + wave_impedance) / self.mass
+        delta_vel_y = -delta_heading * state.boat_vel[0] + (sail_y + cboard_y + rudder_y + damping_y) / self.mass
+        delta_heading_rate = (damping_heading - rudder_y * self.rudder_dist_to_cog + sail_y * self.sail_dist_cog_to_pressure_point + sail_x * jnp.sin(true_sail_angle) * self.sail_dist_mast_to_pressure_point + cboard_y * (self.cboard_dist_cog_to_pressure_point * (1 - hydro_separation) + self.cboard_dist_cog_to_middle * hydro_separation)) / self.moi_z
+        # delta_heading_rate = (damping_heading) / self.moi_z
 
         # 8) Apply differential step
         new_boat_pos = state.boat_pos + delta_pos * self.dt
-        # new_boat_heading = state.boat_heading + delta_yaw * self.dt
-        # new_boat_vel = state.boat_vel
         new_boat_vel = state.boat_vel + jnp.array((delta_vel_x, delta_vel_y)) * self.dt
-        # new_boat_heading_rate = state.boat_heading_rate + delta_yaw_rate * self.dt
-
-        # TODO do I have to normalise heading to ensure between a set range?
+        new_boat_heading = state.boat_heading + delta_heading * self.dt
+        new_boat_heading_rate = state.boat_heading_rate + delta_heading_rate * self.dt
+        # new_boat_heading = state.boat_heading
+        # new_boat_heading_rate = state.boat_heading_rate
 
         # Update state dict and evaluate termination conditions
         new_state = EnvState(boat_pos=new_boat_pos,
-                             boat_heading=state.boat_heading,
                              boat_vel=new_boat_vel,
-                             boat_heading_rate=state.boat_heading_rate,
+                             boat_heading=new_boat_heading,
+                             boat_heading_rate=new_boat_heading_rate,
+                             rudder_angle=rudder_angle,
+                             sail_angle=sail_angle,
                              time=state.time + 1,
                              )
 
@@ -244,16 +280,15 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
     def reset_env(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
         # init_state = jrandom.uniform(key, minval=-0.05, maxval=0.05, shape=(4,))
-        init_pos = jnp.array(((self.screen_width / 2,), (25,)))
-        # init_dir = jnp.radians(jnp.ones(()) * 90)
-        # init_dir = jnp.radians(jnp.ones(()) * 270)
-        # init_dir = jnp.radians(jnp.ones(()) * 45)
-        init_dir = jnp.radians(jnp.ones(()) * 30)
-        init_boat_vel = jnp.array((1.0, 0.0))
-        state = EnvState(boat_pos=init_pos.squeeze(),
+        init_pos = self.init_pos
+        init_dir = jnp.radians(30)
+        init_boat_vel = jnp.array((2.0, 0.0))
+        state = EnvState(boat_pos=init_pos,
                          boat_vel=init_boat_vel.squeeze(),
                          boat_heading=init_dir,
                          boat_heading_rate=jnp.zeros(()),
+                         rudder_angle=jnp.radians(0),
+                         sail_angle=jnp.radians(10),
                          time=0,
                          )
         return self.get_obs(state), state
@@ -280,7 +315,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
     def action_convert(self,
                        action: Union[jnp.int_, jnp.float_, chex.Array]) -> Union[jnp.int_, jnp.float_, chex.Array]:
-        return jnp.clip(action, -self.max_action, self.max_action).squeeze()
+        return jnp.clip(action, jnp.array((self.min_rudder, self.min_sail)), jnp.array((self.max_rudder, self.max_sail))).squeeze()
 
     def get_obs(self, state, key: chex.PRNGKey = None) -> chex.Array:  # TODO sort this out
         boat_speed = jnp.dot(state.boat_vel, self.unit_vector(state.boat_heading))
@@ -289,6 +324,8 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         dist_to_mark = self.dist_to_mark(state)
         obs = jnp.array([boat_speed,
                          angle_to_wind,
+                         state.rudder_angle,
+                         state.sail_angle,
                          state.boat_heading_rate,
                          angle_to_mark,
                          jnp.linalg.norm(dist_to_mark),
@@ -370,11 +407,11 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         boat_plot, = ax.plot([], [], marker=boat_marker_path, markersize=25, linestyle='None', color='purple', label='Boat')
         sail, = ax.plot([], [], color="black", label='Sail')
 
-        agent_path_history = jnp.array(((self.screen_width/2,), (25.0,)))  # TODO how to sort out this hardcoded values
+        agent_path_history = jnp.expand_dims(jnp.array((self.init_pos[1], self.init_pos[0])), axis=0) # TODO how to sort out this hardcoded values
 
         # Draw marks
         for i in range(self.marks.shape[0]):
-            ax.plot(self.marks[i, 0], self.marks[i, 1], color="orange", marker="o", markersize=12, label='Marks')
+            ax.plot(self.marks[i, 1], self.marks[i, 0], color="orange", marker="o", markersize=12, label='Marks')
 
         # # Draw Speed Text
         # font = pygame.font.Font(None, 30)
@@ -383,22 +420,18 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         # screen.blit(speed_text, (10, 10))
 
         def update(frame):
-
-            global agent_path_history
+            nonlocal agent_path_history
 
             y = jnp.expand_dims(trajectory_state.boat_pos[frame, 0], axis=0)
-            # x = self.screen_width - jnp.expand_dims(trajectory_state.boat_pos[frame, 1], axis=0)
             x = jnp.expand_dims(trajectory_state.boat_pos[frame, 1], axis=0)
 
             # TODO need to add boat heading to the image
 
-            agent_path_history = jnp.array(((self.screen_width / 2,), (25.0,)))  # TODO figure out how to sort out this hardcoded fix
-            # TODO above reset for a defined start state perhaps?
-            if x == self.screen_width/2 and y == 25.0:  # TODO figure out how to sort out this hardcoded fix
-                agent_path_history = jnp.array(((self.screen_width/2,), (25.0,)))
+            if  x == self.init_pos[0] and y == self.init_pos[1]:  # TODO figure out how to sort out this hardcoded fix
+                agent_path_history = jnp.expand_dims(jnp.array((self.init_pos[1], self.init_pos[0])), axis=0)
             else:
-                xy = jnp.concatenate((jnp.expand_dims(x, 0), jnp.expand_dims(y, 0)))
-                agent_path_history = jnp.concatenate((agent_path_history, xy), axis=-1)
+                xy = jnp.concatenate((jnp.expand_dims(x, 0), jnp.expand_dims(y, 0)), axis=-1)
+                agent_path_history = jnp.concatenate((agent_path_history, xy), axis=0)
 
             t = markers.MarkerStyle(marker=boat_marker_path)
             t._transform = t.get_transform().rotate_deg(jnp.degrees(unit_circle_to_compass(trajectory_state.boat_heading[frame])))
@@ -411,7 +444,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
             sail.set_data([x, x + sail_length * jnp.cos(sail_angle_global)],
                           [y, y + sail_length * jnp.sin(sail_angle_global)])
 
-            line.set_data(agent_path_history[0], agent_path_history[1])
+            line.set_data(agent_path_history[:, 0], agent_path_history[:, 1])
 
             reward = self.reward_function(jnp.zeros(1,),
                                          jax.tree.map(lambda x: x[frame], trajectory_state),
@@ -438,24 +471,32 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         return "SailingEnv-v0"
 
     def action_space(self) -> spaces.Box:
-        return spaces.Box(-self.max_action, self.max_action, (1,), dtype=jnp.float32)
+        low = jnp.array((-self.min_rudder,
+                         self.min_sail))
+        hi = jnp.array((-self.max_rudder,
+                         self.max_sail))
+        return spaces.Box(low, hi, (2,), dtype=jnp.float32)
 
     def observation_space(self) -> spaces.Box:
         max_dist = jnp.sqrt(jnp.square(self.screen_width) + jnp.square(self.screen_height))
         # TODO sort out the above to be a bit better
         low = jnp.array([0.0,
                          -jnp.pi,
+                         self.min_rudder,
+                         self.min_sail,
                          0.0,
                          -jnp.pi,
                          0.0,
                          ])
-        high = jnp.array([self.max_speed,
+        high = jnp.array([100,  # TODO random for now
                           jnp.pi,
-                          self.acceleration,  # TODO check this is correct
+                          self.max_rudder,
+                          self.max_sail,
+                          100,  # TODO check this is correct
                           jnp.pi,
                           max_dist,
                           ])
-        return spaces.Box(-low, high, (5,), dtype=jnp.float32)
+        return spaces.Box(-low, high, (7,), dtype=jnp.float32)
 
 
 class SailingEnvCSDA(SailingEnvCSCA):
@@ -475,7 +516,7 @@ if __name__ == '__main__':
     print(jax.extend.backend.get_backend().platform)
 
     with jax.disable_jit(disable=False):
-        key = jrandom.PRNGKey(42)
+        key = jrandom.key(42)
 
         env = SailingEnvCSCA()
 
@@ -488,8 +529,8 @@ if __name__ == '__main__':
             def _step(runner_state, unused):
                 obs, state, key = runner_state
                 key, _key = jrandom.split(key)
-                # action = env.action_space().sample(_key)
-                action = jnp.zeros(1,)
+                action = env.action_space().sample(_key)
+                # action = jnp.zeros(1,)
                 # action = jnp.ones(1,)
 
                 key, _key = jrandom.split(key)

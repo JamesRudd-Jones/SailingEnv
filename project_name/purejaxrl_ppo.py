@@ -37,9 +37,9 @@ class ActorCritic(nn.Module):
         actor_mean = activation(actor_mean)
         actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0))(actor_mean)
 
-        # actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
-        # pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
-        pi = distrax.Categorical(logits=actor_mean)
+        actor_logtstd = self.param("log_std", nn.initializers.zeros, (self.action_dim,))
+        pi = distrax.MultivariateNormalDiag(actor_mean, jnp.exp(actor_logtstd))
+        # pi = distrax.Categorical(logits=actor_mean)
 
         critic = nn.Dense(256, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
         critic = activation(critic)
@@ -82,9 +82,9 @@ def make_train(env, config):
 
     def train(rng):
         # INIT NETWORK
-        network = ActorCritic(env.action_space().num_discrete, activation=config["ACTIVATION"])
-        # network = ActorCritic(env.action_space().shape[0], activation=config["ACTIVATION"])
-        rng, _rng = jax.random.split(rng)
+        # network = ActorCritic(env.action_space().num_discrete, activation=config["ACTIVATION"])
+        network = ActorCritic(env.action_space().shape[0], activation=config["ACTIVATION"])
+        rng, _rng = jrandom.split(rng)
         init_x = jnp.zeros(env.observation_space().shape)
         network_params = network.init(_rng, init_x)
         if config["ANNEAL_LR"]:
@@ -101,8 +101,8 @@ def make_train(env, config):
                                         )
 
         # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        rng, _rng = jrandom.split(rng)
+        reset_rng = jrandom.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset)(reset_rng)
 
         # TRAIN LOOP
@@ -112,14 +112,14 @@ def make_train(env, config):
                 train_state, env_state, last_obs, rng = runner_state
 
                 # SELECT ACTION
-                rng, _rng = jax.random.split(rng)
+                rng, _rng = jrandom.split(rng)
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
 
                 # STEP ENV
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+                rng, _rng = jrandom.split(rng)
+                rng_step = jrandom.split(_rng, config["NUM_ENVS"])
                 obsv, _, env_state, reward, done, info = jax.vmap(env.step)(action, env_state, rng_step)
                 transition = Transition(done, action, value, reward, log_prob, last_obs, info)
                 runner_state = (train_state, env_state, obsv, rng)
@@ -196,12 +196,12 @@ def make_train(env, config):
                     return train_state, total_loss
 
                 train_state, traj_batch, advantages, targets, rng = update_state
-                rng, _rng = jax.random.split(rng)
+                rng, _rng = jrandom.split(rng)
                 batch_size = config["MINIBATCH_SIZE"] * config["NUM_MINIBATCHES"]
                 assert (
                     batch_size == config["NUM_STEPS"] * config["NUM_ENVS"]
                 ), "batch size must be equal to number of steps * number of envs"
-                permutation = jax.random.permutation(_rng, batch_size)
+                permutation = jrandom.permutation(_rng, batch_size)
                 batch = (traj_batch, advantages, targets)
                 batch = jax.tree_util.tree_map(lambda x: x.reshape((batch_size,) + x.shape[2:]), batch)
                 shuffled_batch = jax.tree_util.tree_map(lambda x: jnp.take(x, permutation, axis=0), batch)
@@ -233,7 +233,7 @@ def make_train(env, config):
             runner_state = (train_state, env_state, last_obs, rng)
             return runner_state, metric
 
-        rng, _rng = jax.random.split(rng)
+        rng, _rng = jrandom.split(rng)
         runner_state = (train_state, env_state, obsv, _rng)
         runner_state, metric = jax.lax.scan(_update_step, runner_state, None, config["NUM_UPDATES"])
         return {"runner_state": runner_state, "metrics": metric}
@@ -243,37 +243,38 @@ def make_train(env, config):
 
 def make_eval(env, config, train_state):
     # INIT NETWORK
-    network = ActorCritic(env.action_space().num_discrete, activation=config["ACTIVATION"])
-    # network = ActorCritic(env.action_space().shape[0], activation=config["ACTIVATION"])
+    # network = ActorCritic(env.action_space().num_discrete, activation=config["ACTIVATION"])
+    network = ActorCritic(env.action_space().shape[0], activation=config["ACTIVATION"])
     rng = jrandom.key(42)
-    rng, _rng = jax.random.split(rng)
+    rng, _rng = jrandom.split(rng)
     obsv, env_state = env.reset(_rng)
 
-    print("HERE")
+    print("Evaluating...")
 
     def _env_step(runner_state, unused):
         train_state, env_state, last_obs, rng = runner_state
 
         # SELECT ACTION
-        rng, _rng = jax.random.split(rng)
+        rng, _rng = jrandom.split(rng)
         pi, value = network.apply(train_state.params, last_obs)
         action = pi.sample(seed=_rng)
 
         # STEP ENV
-        rng, _rng = jax.random.split(rng)
+        rng, _rng = jrandom.split(rng)
         obsv, _, nenv_state, reward, done, info = env.step(action, env_state, _rng)
         runner_state = (train_state, nenv_state, obsv, rng)
-        return runner_state, env_state
+        return runner_state, (nenv_state, info)
 
-    _, traj_batch = jax.lax.scan(_env_step, (train_state, env_state, obsv, rng), None, 1000)
-    env.render_traj(traj_batch)
+    _, (traj_batch, traj_info) = jax.lax.scan(_env_step, (train_state, env_state, obsv, rng), None, 500)
+    print("Rendering...")
+    env.render_traj(traj_batch, traj_info)
 
 if __name__ == "__main__":
     config = {
         "LR": 3e-4,
         "NUM_ENVS": 64,  # 2048,
-        "NUM_STEPS": 64,
-        "TOTAL_TIMESTEPS": 1000000,  # 5e7,
+        "NUM_STEPS": 256,
+        "TOTAL_TIMESTEPS": 100000,#0#0,  # 5e7,
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 16,
         "GAMMA": 0.99,
@@ -288,9 +289,11 @@ if __name__ == "__main__":
         "NORMALIZE_ENV": False,
         "DEBUG": True,
     }
-    rng = jax.random.PRNGKey(30)
+    print(jax.extend.backend.get_backend().platform)
 
-    env = SailingEnvCSDA()
+    rng = jrandom.key(42)
+
+    env = SailingEnvCSCA()
     # env = wrappers.NormalisedWrapperCSCA(env)
     env = wrappers.AutoResetWrapper(env)
 
