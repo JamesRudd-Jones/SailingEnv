@@ -274,7 +274,7 @@ if __name__ == "__main__":
         "LR": 3e-4,
         "NUM_ENVS": 64,  # 2048,
         "NUM_STEPS": 256,
-        "TOTAL_TIMESTEPS": 100000,#0#0,  # 5e7,
+        "TOTAL_TIMESTEPS": 10000000,  # 5e7,
         "UPDATE_EPOCHS": 4,
         "NUM_MINIBATCHES": 16,
         "GAMMA": 0.99,
