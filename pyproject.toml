@@ -6,7 +6,6 @@ authors = [
     {name = "james", email = "james.rj.rj@gmail.com"},
 ]
 dependencies = [
-                "pygame>=2.6.1",
                 "matplotlib>=3.10.1",
                 "jax[cuda]>=0.6.0",
                 "chex>=0.1.89",
