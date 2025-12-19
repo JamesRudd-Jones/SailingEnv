@@ -104,10 +104,6 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
         # Adjust and apply actions
         action = self.action_convert(input_action)
-        # sail_angle = jnp.radians(20.0)  # can range between 0 and 90
-        # rudder_angle = -0.02  # action
-        # rudder_angle = action[0]
-        # sail_angle = action[1]
 
         delta_rudder = -2 * (action[0] - state.rudder_angle)
         max_rudder_speed = jnp.pi / 20
@@ -176,9 +172,6 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                                             2.66 / jnp.sqrt((boat_speed * self.cboard_chord) / self.water_kinematic_viscosity),
                                             0.0)
 
-            # coeff_lift = (2 * jnp.pi * eff_leeway_angle) / (1 + 2 / self.cboard_aspect_ratio)
-            # coeff_drag = hydro_friction * coeff_lift ** 2
-
             coeff_lift = 2 * jnp.pi * eff_leeway_angle
             coeff_drag = hydro_friction * (coeff_lift ** 2 / (jnp.pi * self.cboard_aspect_ratio))
 
@@ -186,7 +179,7 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
             cboard_lift = hydro_pressure * self.cboard_area * coeff_lift
             cboard_drag = hydro_pressure * self.cboard_area * coeff_drag
 
-            cboard_force_x = -cboard_drag * jnp.cos(leeway_angle) - cboard_lift * jnp.sin(leeway_angle)
+            cboard_force_x = -cboard_drag * jnp.cos(leeway_angle) + cboard_lift * jnp.sin(leeway_angle)
             cboard_force_y = -cboard_lift * jnp.cos(leeway_angle) - cboard_drag * jnp.sin(leeway_angle)
 
             hydro_separation = 1 - jnp.exp(-jnp.square(jnp.abs(eff_leeway_angle) / jnp.radians(25)))
@@ -195,6 +188,30 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
             cboard_x = (1 - hydro_separation) * cboard_force_x
             cboard_y = (1 - hydro_separation) * cboard_force_y + hydro_separation * cboard_separated_force_y
+
+            """ New stuff """  # TODO need to rewrite to be better but the other thing is causing the issues
+            # Boat velocities
+            cboard_lat_force_coeff = 5000.0  # N at ~1 m/s speed
+            cboard_lat_force_cap = 15000.0  # maximum lateral force
+            cboard_v_ref = 0.3
+            v_x, v_y = curr_state.boat_vel
+            boat_speed = jnp.sqrt(v_x ** 2 + v_y ** 2 + 1e-6)  # avoid div by zero
+
+            # Leeway angle
+            leeway_angle = jnp.arctan2(v_y, jnp.abs(v_x) + 1e-6)  # β in radians
+
+            # Force parameters
+            F_lat_max = cboard_lat_force_coeff * boat_speed ** 2  # scales with dynamic pressure
+            F_lat_max = jnp.clip(F_lat_max, 0.0, cboard_lat_force_cap)  # optional cap
+
+            v_ref = cboard_v_ref  # sets saturation speed
+            angle_factor = jnp.cos(leeway_angle) ** 2  # reduces force at very high sideslip
+
+            # Stable lateral force
+            cboard_y = -F_lat_max * angle_factor * jnp.tanh(v_y / v_ref)
+
+            # Longitudinal contribution negligible for simplicity
+            cboard_x = 0.0
 
             # Calc rudder force
             rudder_x = -(((4 * jnp.pi) / self.rudder_aspect_ratio) * r_angle ** 2) * hydro_pressure * self.rudder_area
@@ -207,8 +224,8 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
             damping_heading = self.damping_invariant_heading * curr_state.boat_heading_rate
 
             # Calc wave impedance
-            # wave_impedance = -jnp.sign(curr_state.boat_vel[0]) * self.wave_resistance_param * hydro_pressure * self.lateral_area * (boat_speed / self.hull_speed) ** 4
-            wave_impedance = jnp.zeros(())
+            wave_impedance = -jnp.sign(curr_state.boat_vel[0]) * self.wave_resistance_param * hydro_pressure * self.lateral_area * (boat_speed / self.hull_speed) ** 4
+            # wave_impedance = jnp.zeros(())
 
             # Sum up forces and turn to velocities
             delta_pos = self.boat_to_global(curr_state.boat_heading, curr_state.boat_vel)
@@ -234,52 +251,52 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                                                                                                           state.sail_angle)
 
         """ Euler discretisation step """
-        new_boat_pos = state.boat_pos + deltas[0] * self.dt
-        new_boat_vel = state.boat_vel + deltas[1] * self.dt
-        new_boat_heading = state.boat_heading + deltas[2] * self.dt
-        new_boat_heading_rate = state.boat_heading_rate + deltas[3] * self.dt
-        # new_boat_heading = state.boat_heading
-        # new_boat_heading_rate = state.boat_heading_rate
+        # new_boat_pos = state.boat_pos + deltas[0] * self.dt
+        # new_boat_vel = state.boat_vel + deltas[1] * self.dt
+        # new_boat_heading = state.boat_heading + deltas[2] * self.dt
+        # new_boat_heading_rate = state.boat_heading_rate + deltas[3] * self.dt
+        # # new_boat_heading = state.boat_heading
+        # # new_boat_heading_rate = state.boat_heading_rate
         """ End Euler """
 
-        # """ RK4 discretisation step """
-        # k1_rates, (true_sail_angle, sail_x, sail_y, cboard_x, cboard_y, hydro_separation) = get_derivatives(state,
-        #                                                                                                     state.rudder_angle,
-        #                                                                                                     state.sail_angle)
-        #
-        # state_k2 = EnvState(boat_pos=state.boat_pos + k1_rates[0] * self.dt / 2,
-        #                     boat_vel=state.boat_vel + k1_rates[1] * self.dt / 2,
-        #                     boat_heading=state.boat_heading + k1_rates[2] * self.dt / 2,
-        #                     boat_heading_rate=state.boat_heading_rate + k1_rates[3] * self.dt / 2,
-        #                     rudder_angle=rudder_angle,
-        #                     sail_angle=sail_angle,
-        #                     time=state.time)
-        # k2_rates, _ = get_derivatives(state_k2, state.rudder_angle, state.sail_angle)
-        #
-        # state_k3 = EnvState(boat_pos=state.boat_pos + k2_rates[0] * self.dt / 2,
-        #                     boat_vel=state.boat_vel + k2_rates[1] * self.dt / 2,
-        #                     boat_heading=state.boat_heading + k2_rates[2] * self.dt / 2,
-        #                     boat_heading_rate=state.boat_heading_rate + k2_rates[3] * self.dt / 2,
-        #                     rudder_angle=rudder_angle,
-        #                     sail_angle=sail_angle,
-        #                     time=state.time)
-        # k3_rates, _ = get_derivatives(state_k3, state.rudder_angle, state.sail_angle)
-        #
-        # state_k4 = EnvState(boat_pos=state.boat_pos + k3_rates[0] * self.dt,
-        #                     boat_vel=state.boat_vel + k3_rates[1] * self.dt,
-        #                     boat_heading=state.boat_heading + k3_rates[2] * self.dt,
-        #                     boat_heading_rate=state.boat_heading_rate + k3_rates[3] * self.dt,
-        #                     rudder_angle=rudder_angle,
-        #                     sail_angle=sail_angle,
-        #                     time=state.time)
-        # k4_rates, _ = get_derivatives(state_k4, state.rudder_angle, state.sail_angle)
-        #
-        # # Final RK4 update
-        # new_boat_pos = state.boat_pos + self.dt / 6 * (k1_rates[0] + 2 * k2_rates[0] + 2 * k3_rates[0] + k4_rates[0])
-        # new_boat_vel = state.boat_vel + self.dt / 6 * (k1_rates[1] + 2 * k2_rates[1] + 2 * k3_rates[1] + k4_rates[1])
-        # new_boat_heading = state.boat_heading + self.dt / 6 * (k1_rates[2] + 2 * k2_rates[2] + 2 * k3_rates[2] + k4_rates[2])
-        # new_boat_heading_rate = state.boat_heading_rate + self.dt / 6 * (k1_rates[3] + 2 * k2_rates[3] + 2 * k3_rates[3] + k4_rates[3])
-        # """ End RK4 """
+        """ RK4 discretisation step """
+        k1_rates, (true_sail_angle, sail_x, sail_y, cboard_x, cboard_y, hydro_separation) = get_derivatives(state,
+                                                                                                            state.rudder_angle,
+                                                                                                            state.sail_angle)
+
+        state_k2 = EnvState(boat_pos=state.boat_pos + k1_rates[0] * self.dt / 2,
+                            boat_vel=state.boat_vel + k1_rates[1] * self.dt / 2,
+                            boat_heading=state.boat_heading + k1_rates[2] * self.dt / 2,
+                            boat_heading_rate=state.boat_heading_rate + k1_rates[3] * self.dt / 2,
+                            rudder_angle=rudder_angle,
+                            sail_angle=sail_angle,
+                            time=state.time)
+        k2_rates, _ = get_derivatives(state_k2, state.rudder_angle, state.sail_angle)
+
+        state_k3 = EnvState(boat_pos=state.boat_pos + k2_rates[0] * self.dt / 2,
+                            boat_vel=state.boat_vel + k2_rates[1] * self.dt / 2,
+                            boat_heading=state.boat_heading + k2_rates[2] * self.dt / 2,
+                            boat_heading_rate=state.boat_heading_rate + k2_rates[3] * self.dt / 2,
+                            rudder_angle=rudder_angle,
+                            sail_angle=sail_angle,
+                            time=state.time)
+        k3_rates, _ = get_derivatives(state_k3, state.rudder_angle, state.sail_angle)
+
+        state_k4 = EnvState(boat_pos=state.boat_pos + k3_rates[0] * self.dt,
+                            boat_vel=state.boat_vel + k3_rates[1] * self.dt,
+                            boat_heading=state.boat_heading + k3_rates[2] * self.dt,
+                            boat_heading_rate=state.boat_heading_rate + k3_rates[3] * self.dt,
+                            rudder_angle=rudder_angle,
+                            sail_angle=sail_angle,
+                            time=state.time)
+        k4_rates, _ = get_derivatives(state_k4, state.rudder_angle, state.sail_angle)
+
+        # Final RK4 update
+        new_boat_pos = state.boat_pos + self.dt / 6 * (k1_rates[0] + 2 * k2_rates[0] + 2 * k3_rates[0] + k4_rates[0])
+        new_boat_vel = state.boat_vel + self.dt / 6 * (k1_rates[1] + 2 * k2_rates[1] + 2 * k3_rates[1] + k4_rates[1])
+        new_boat_heading = state.boat_heading + self.dt / 6 * (k1_rates[2] + 2 * k2_rates[2] + 2 * k3_rates[2] + k4_rates[2])
+        new_boat_heading_rate = state.boat_heading_rate + self.dt / 6 * (k1_rates[3] + 2 * k2_rates[3] + 2 * k3_rates[3] + k4_rates[3])
+        """ End RK4 """
 
         # TODO is it worth adding in acceleration into this?
 
@@ -349,12 +366,9 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
     def reset_env(self, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
         # init_state = jrandom.uniform(key, minval=-0.05, maxval=0.05, shape=(4,))
-        init_pos = self.init_pos
-        init_dir = jnp.radians(40)
-        init_boat_vel = jnp.array((0.0, 0.0))
-        state = EnvState(boat_pos=init_pos,
-                         boat_vel=init_boat_vel.squeeze(),
-                         boat_heading=init_dir,
+        state = EnvState(boat_pos=self.init_pos,
+                         boat_vel=jnp.array((0.0, 0.0)).squeeze(),
+                         boat_heading=jnp.radians(45),
                          boat_heading_rate=jnp.zeros(()),
                          rudder_angle=jnp.radians(0),
                          sail_angle=jnp.radians(10),
@@ -423,19 +437,8 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
     def create_boat_marker():
         import matplotlib.path as mpath
         # A triangle pointing to the right (0 degrees)
-        verts = [(-0.5, -0.25),
-                 (-0.5, 0.25),
-                 (0.25, 0),
-                 (-0.5, -0.25),
-        ]
-
-        codes = [
-            mpath.Path.MOVETO,
-            mpath.Path.LINETO,
-            mpath.Path.LINETO,
-            mpath.Path.CLOSEPOLY,
-        ]
-
+        verts = [(-0.5, -0.25), (-0.5, 0.25), (0.25, 0), (-0.5, -0.25)]
+        codes = [mpath.Path.MOVETO, mpath.Path.LINETO, mpath.Path.LINETO, mpath.Path.CLOSEPOLY]
         boat_path = mpath.Path(verts, codes)
 
         return boat_path
@@ -603,7 +606,8 @@ if __name__ == '__main__':
                 # action = env.action_space().sample(_key)
                 action = jnp.zeros(2,)
                 # action = jnp.ones(2,)
-                action = jnp.array((0.1, jnp.radians(10)))
+                # action = jnp.array((0.1, jnp.radians(10)))
+                action = jnp.array((0.01, jnp.radians(10)))
 
                 key, _key = jrandom.split(key)
                 nobs, delta_obs, nstate, reward, done, info = env.step(action, state, _key)
@@ -621,12 +625,15 @@ if __name__ == '__main__':
         axs[0, 0].plot(time, forward_speed, color="blue", label="Forward")
         axs[0, 0].plot(time, leeway, color="red", label="Leeway")
         axs[0, 0].plot(time, hydro_sep, color="green", label="Hydro Separation")
-        # plt.xlim(0, 3 // env.dt)
-        axs[0, 0].set_ylim(0, 1)
+        # axs[0, 0].set_xlim(0, 3 // env.dt)
+        left_bound = 130
+        axs[0, 0].set_xlim(130)
+        axs[0, 0].set_ylim(-1, 1)
         axs[0, 0].legend()
 
         axs[1, 0].plot(time, traj_state.boat_heading, color="purple", label="Boat Heading")
         axs[1, 0].plot(time, traj_state.boat_heading_rate, color="pink", label="Boat Heading Rate")
+        axs[1, 0].set_xlim(left_bound)
         axs[1, 0].set_ylim(0, 10)
         axs[1, 0].legend()
 
