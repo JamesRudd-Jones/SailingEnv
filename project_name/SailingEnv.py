@@ -14,9 +14,6 @@ class EnvState(base_env.EnvState):
     boat_pos: jnp.ndarray
     boat_vel: jnp.ndarray
     boat_heading: jnp.ndarray
-    boat_heading_rate: jnp.ndarray
-    rudder_angle: jnp.ndarray
-    sail_angle: jnp.ndarray
     time: int
 
 
@@ -38,54 +35,17 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
         self.wind_vel: jnp.ndarray = -self.wind_speed * jnp.array((jnp.cos(jnp.radians(self.wind_dir)),
                                                                    jnp.sin(jnp.radians(self.wind_dir))))  # ms^-1
 
-        self.mass: float = 120.0  # kg
+        self.hull_speed = 2.5  # max achievable speed
+        self.mass = 120.0
+        self.max_rudder = jnp.radians(35)
+        self.min_rudder = jnp.radians(-35)
 
-        self.gravity = 9.81  # ms^-2
+        # Sail trim
+        self.min_sail = 0.0
+        self.max_sail = 1.0  # normalized (0=depowered, 1=full)
 
-        self.rudder_area: float = 0.13  # m^2
-        self.rudder_aspect_ratio: float = 2.326923076923077  # self.rudder_span / self.rudder_chord  # TODO aka rudder stretching in the paper
-        self.rudder_dist_to_cog: float = 1.24  # m
-        self.min_rudder: jnp.ndarray = jnp.radians(-35)  # rads
-        self.max_rudder: jnp.ndarray = jnp.radians(35)  # rads
-
-        self.air_kinematic_viscosity: float = 0.0000171  # Pa * s
-        self.air_density: float =  1.3  # kgm^-3
-
-        self.sail_area: float = 6.4  # m^2
-        self.sail_chord: float = 1  # m
-        self.sail_span: float = 6.2   # m
-        # self.sail_aspect_ratio: float = 0.961
-        self.sail_aspect_ratio = self.sail_span / self.sail_chord  # TODO changed this for testing
-        self.sail_dist_cog_to_pressure_point: float = 0.43  # m
-        self.sail_dist_mast_to_pressure_point: float = 0.68  # m
-        self.min_sail: jnp.ndarray = jnp.radians(0)  # rads
-        self.max_sail: jnp.ndarray = jnp.radians(90)  # rads
-
-        self.water_kinematic_viscosity: float = 0.0000001  # Pa * s
-        self.water_density: float = 1000  # kgm^-3
-
-        self.cboard_area: float = 0.5  # m^2
-        self.cboard_chord: float = 2  # m
-        self.cboard_span: float = 0.55  # m
-        # self.cboard_aspect_ratio: float = 0.605
-        self.cboard_aspect_ratio = self.cboard_span / self.cboard_chord  # TODO change it back
-        self.cboard_dist_cog_to_pressure_point: float = 0.24  # m
-        self.cboard_dist_cog_to_middle: float = self.cboard_dist_cog_to_pressure_point - 0.7  # m # TODO sort all these COG distances out
-
-        self.waterline_length: float = 4  # m
-        self.hull_speed: jnp.ndarray = 2.5  # 0.4 * jnp.sqrt(self.gravity * self.waterline_length)  # ms^-1  # TODO return this back to equation
-        self.lateral_area: float = 2.5  # m^2
-        self.wave_resistance_param: float = 1
-
-        self.along_damping: float = 15
-        self.transverse_damping: float = 5
-        self.heading_time_constant: float = 5
-        self.moi_z: float = 1066  # kgm^2
-
-        self.damping_invariant_x: float = -self.mass / self.along_damping
-        self.damping_invariant_y: float = -self.mass / self.transverse_damping
-        self.damping_invariant_heading: float = -(self.moi_z / self.heading_time_constant)
-        self.wave_impedance_invariant: float = (self.water_density / 2) * self.lateral_area
+        # Rudder stall
+        self.rudder_stall_angle = jnp.radians(30)
 
         self.screen_width: int = 100  # m
         self.screen_height: int = 100  # m
@@ -104,18 +64,8 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
 
         # Adjust and apply actions
         action = self.action_convert(input_action)
-
-        delta_rudder = -2 * (action[0] - state.rudder_angle)
-        max_rudder_speed = jnp.pi / 20
-        delta_rudder = jnp.clip(delta_rudder, -max_rudder_speed, max_rudder_speed)
-
-        delta_sail = -2 * (action[1] - state.sail_angle)
-        max_sail_speed = jnp.pi
-        delta_sail = jnp.clip(delta_sail, -max_sail_speed, max_sail_speed)
-
-        rudder_angle = jnp.clip(state.rudder_angle + delta_rudder * self.dt, self.min_rudder, self.max_rudder)
-        sail_angle = jnp.clip(state.sail_angle + delta_sail * self.dt, self.min_sail, self.max_sail)
-        # TODO is there a better way to do this?
+        rudder_angle = jnp.clip(action[0], self.min_rudder, self.max_rudder)
+        sail_angle = jnp.clip(action[1], self.min_sail, self.max_sail)
 
         def get_derivatives(curr_state, r_angle, s_angle):
             # Convert wind to boat and find apparent wind
@@ -124,157 +74,35 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
             apparent_wind_angle = jnp.arctan2(-apparent_wind[1], -apparent_wind[0])
             apparent_wind_speed = jnp.sqrt(apparent_wind[0] ** 2 + apparent_wind[1] ** 2)
 
-            # Calc aoa
-            true_sail_angle = jnp.sign(apparent_wind_angle) * jnp.abs(s_angle)
-            aoa = apparent_wind_angle - true_sail_angle
+            # Boat speed along heading
+            boat_speed = self.polar_speed_curve(apparent_wind_angle, s_angle)
+            vel_x = boat_speed * jnp.cos(state.boat_heading)
+            vel_y = boat_speed * jnp.sin(state.boat_heading)
 
-            # Calc sail force
-            aoa = jax.lax.select(aoa * true_sail_angle < 0, 0.0, aoa)
+            # Rudder: stalling at high deflection
+            stall_factor = jnp.clip(1 - (jnp.abs(rudder_angle) / self.rudder_stall_angle) ** 2, 0.0, 1.0)
+            turn_rate = stall_factor * rudder_angle * 2.0  # simple proportional
 
-            eff_aoa = jnp.select([aoa < -jnp.pi / 2, aoa > jnp.pi / 2],
-                                 [jnp.pi + aoa, -jnp.pi + aoa],
-                                 aoa)
+            # Lateral resistance (centerboard)
+            leeway = jnp.arctan2(state.boat_vel[1], state.boat_vel[0])
+            lateral_force = -2.0 * leeway  # linear approx
 
-            aero_friction = jax.lax.select(apparent_wind_speed != 0,
-                                           2.66 / jnp.sqrt((apparent_wind_speed * self.sail_chord) / self.air_kinematic_viscosity),
-                                           0.0)
+            delta_vel = jnp.array([vel_x - state.boat_vel[0], vel_y - state.boat_vel[1]])
+            delta_heading = turn_rate
 
-            # coeff_lift = (2 * jnp.pi * eff_aoa) / (1 + 2 / self.sail_aspect_ratio)
-            # coeff_drag = aero_friction * coeff_lift ** 2
-
-            coeff_lift = 2 * jnp.pi * eff_aoa
-            coeff_drag = aero_friction + (coeff_lift ** 2 / (jnp.pi * self.sail_aspect_ratio))
-
-            aero_pressure = 0.5 * self.air_density * apparent_wind_speed ** 2
-            sail_lift = aero_pressure * self.sail_area * coeff_lift
-            sail_drag = aero_pressure * self.sail_area * coeff_drag
-
-            sail_force_x = -sail_drag * jnp.cos(apparent_wind_angle) + sail_lift * jnp.sin(apparent_wind_angle)
-            sail_force_y = -sail_lift * jnp.cos(apparent_wind_angle) - sail_drag * jnp.sin(apparent_wind_angle)
-
-            aero_separation = 1 - jnp.exp(-jnp.square(jnp.abs(eff_aoa) / jnp.radians(25)))
-
-            sail_separated_force_x = jnp.sign(aoa) * aero_pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.sin(true_sail_angle)
-            sail_separated_force_y = -jnp.sign(aoa) * aero_pressure * self.sail_area * jnp.sin(aoa) ** 2 * jnp.cos(true_sail_angle)
-
-            sail_x = (1 - aero_separation) * sail_force_x + aero_separation * sail_separated_force_x
-            sail_y = (1 - aero_separation) * sail_force_y + aero_separation * sail_separated_force_y
-
-            # Calc centreboard force
-            boat_speed = jnp.sqrt(curr_state.boat_vel[0] ** 2 + curr_state.boat_vel[1] ** 2)
-            leeway_angle = jnp.arctan2(curr_state.boat_vel[1], curr_state.boat_vel[0])
-
-            eff_leeway_angle = jnp.select([leeway_angle < -jnp.pi / 2, leeway_angle > jnp.pi / 2],
-                                          [jnp.pi + leeway_angle, -jnp.pi + leeway_angle],
-                                          default=leeway_angle)
-
-            hydro_friction = jax.lax.select(boat_speed != 0,
-                                            2.66 / jnp.sqrt((boat_speed * self.cboard_chord) / self.water_kinematic_viscosity),
-                                            0.0)
-
-            coeff_lift = 2 * jnp.pi * eff_leeway_angle
-            coeff_drag = hydro_friction * (coeff_lift ** 2 / (jnp.pi * self.cboard_aspect_ratio))
-
-            hydro_pressure = 0.5 * self.water_density * boat_speed ** 2
-            cboard_lift = hydro_pressure * self.cboard_area * coeff_lift
-            cboard_drag = hydro_pressure * self.cboard_area * coeff_drag
-
-            cboard_force_x = -cboard_drag * jnp.cos(leeway_angle) + cboard_lift * jnp.sin(leeway_angle)
-            cboard_force_y = -cboard_lift * jnp.cos(leeway_angle) - cboard_drag * jnp.sin(leeway_angle)
-
-            hydro_separation = 1 - jnp.exp(-jnp.square(jnp.abs(eff_leeway_angle) / jnp.radians(25)))
-
-            cboard_separated_force_y = -jnp.sign(leeway_angle) * hydro_pressure * self.cboard_area * jnp.sin(leeway_angle) ** 2
-
-            cboard_x = (1 - hydro_separation) * cboard_force_x
-            cboard_y = (1 - hydro_separation) * cboard_force_y + hydro_separation * cboard_separated_force_y
-
-            """ New stuff """  # TODO need to rewrite to be better but the other thing is causing the issues
-            # Boat velocities
-            cboard_lat_force_coeff = 5000.0  # N at ~1 m/s speed
-            cboard_lat_force_cap = 15000.0  # maximum lateral force
-            cboard_v_ref = 0.3
-            v_x, v_y = curr_state.boat_vel
-            boat_speed = jnp.sqrt(v_x ** 2 + v_y ** 2 + 1e-6)  # avoid div by zero
-
-            # Leeway angle
-            leeway_angle = jnp.arctan2(v_y, jnp.abs(v_x) + 1e-6)  # β in radians
-
-            # Force parameters
-            F_lat_max = cboard_lat_force_coeff * boat_speed ** 2  # scales with dynamic pressure
-            F_lat_max = jnp.clip(F_lat_max, 0.0, cboard_lat_force_cap)  # optional cap
-
-            v_ref = cboard_v_ref  # sets saturation speed
-            angle_factor = jnp.cos(leeway_angle) ** 2  # reduces force at very high sideslip
-
-            # Stable lateral force
-            cboard_y = -F_lat_max * angle_factor * jnp.tanh(v_y / v_ref)
-
-            # Longitudinal contribution negligible for simplicity
-            cboard_x = 0.0
-
-            # Calc rudder force
-            rudder_x = -(((4 * jnp.pi) / self.rudder_aspect_ratio) * r_angle ** 2) * hydro_pressure * self.rudder_area
-            rudder_y = 2 * jnp.pi * hydro_pressure * self.rudder_area * r_angle
-            # TODO this assumes rudder doesn't stall, it would be interesting if possible to add this as a feature perhaps
-
-            # Calc damping
-            damping_x = self.damping_invariant_x * curr_state.boat_vel[0]
-            damping_y = self.damping_invariant_y * curr_state.boat_vel[1]
-            damping_heading = self.damping_invariant_heading * curr_state.boat_heading_rate
-
-            # Calc wave impedance
-            wave_impedance = -jnp.sign(curr_state.boat_vel[0]) * self.wave_resistance_param * hydro_pressure * self.lateral_area * (boat_speed / self.hull_speed) ** 4
-            # wave_impedance = jnp.zeros(())
-
-            # Sum up forces and turn to velocities
-            delta_pos = self.boat_to_global(curr_state.boat_heading, curr_state.boat_vel)
-            delta_heading = curr_state.boat_heading_rate
-
-            # delta_vel_x = (sail_x + cboard_x + rudder_x + damping_x + wave_impedance) / self.mass
-            # delta_vel_y = (sail_y + cboard_y + rudder_y + damping_y) / self.mass
-            delta_vel_x = delta_heading * curr_state.boat_vel[1] + (sail_x + cboard_x + rudder_x + damping_x + wave_impedance) / self.mass
-            delta_vel_y = -delta_heading * curr_state.boat_vel[0] + (sail_y + cboard_y + rudder_y + damping_y) / self.mass
-            # delta_heading_rate = (damping_heading
-            #                       - rudder_y * self.rudder_dist_to_cog
-            #                       + sail_y * self.sail_dist_cog_to_pressure_point
-            #                       + sail_x * jnp.sin(true_sail_angle) * self.sail_dist_mast_to_pressure_point
-            #                       + cboard_y * (self.cboard_dist_cog_to_pressure_point * (1 - hydro_separation)
-            #                                     + self.cboard_dist_cog_to_middle * hydro_separation)) / self.moi_z
-            delta_heading_rate = (damping_heading - rudder_y * self.rudder_dist_to_cog) / self.moi_z
-
-            return ((delta_pos, jnp.array((delta_vel_x, delta_vel_y)), delta_heading, delta_heading_rate),
-                    (true_sail_angle, sail_x, sail_y, cboard_x, cboard_y, hydro_separation))
-
-        deltas, (true_sail_angle, sail_x, sail_y, cboard_x, cboard_y, hydro_separation) = get_derivatives(state,
-                                                                                                          state.rudder_angle,
-                                                                                                          state.sail_angle)
-
-        """ Euler discretisation step """
-        # new_boat_pos = state.boat_pos + deltas[0] * self.dt
-        # new_boat_vel = state.boat_vel + deltas[1] * self.dt
-        # new_boat_heading = state.boat_heading + deltas[2] * self.dt
-        # new_boat_heading_rate = state.boat_heading_rate + deltas[3] * self.dt
-        # # new_boat_heading = state.boat_heading
-        # # new_boat_heading_rate = state.boat_heading_rate
-        """ End Euler """
+            return delta_vel, delta_heading
 
         """ RK4 discretisation step """
-        k1_rates, (true_sail_angle, sail_x, sail_y, cboard_x, cboard_y, hydro_separation) = get_derivatives(state,
-                                                                                                            state.rudder_angle,
-                                                                                                            state.sail_angle)
+        k1_vel, k1_head = get_derivatives(state, state.rudder_angle, state.sail_angle)
 
-        state_k2 = EnvState(boat_pos=state.boat_pos + k1_rates[0] * self.dt / 2,
-                            boat_vel=state.boat_vel + k1_rates[1] * self.dt / 2,
-                            boat_heading=state.boat_heading + k1_rates[2] * self.dt / 2,
-                            boat_heading_rate=state.boat_heading_rate + k1_rates[3] * self.dt / 2,
-                            rudder_angle=rudder_angle,
-                            sail_angle=sail_angle,
+        state_k2 = EnvState(boat_pos=state.boat_pos + k1_vel * self.dt / 2,
+                            boat_vel=state.boat_vel + k1_vel * self.dt / 2,
+                            boat_heading=state.boat_heading + k1_head * self.dt / 2,
                             time=state.time)
-        k2_rates, _ = get_derivatives(state_k2, state.rudder_angle, state.sail_angle)
+        k2_vel, k2_head = get_derivatives(state_k2, state.rudder_angle, state.sail_angle)
 
-        state_k3 = EnvState(boat_pos=state.boat_pos + k2_rates[0] * self.dt / 2,
-                            boat_vel=state.boat_vel + k2_rates[1] * self.dt / 2,
+        state_k3 = EnvState(boat_pos=state.boat_pos + k2_vel * self.dt / 2,
+                            boat_vel=state.boat_vel + k2_vel * self.dt / 2,
                             boat_heading=state.boat_heading + k2_rates[2] * self.dt / 2,
                             boat_heading_rate=state.boat_heading_rate + k2_rates[3] * self.dt / 2,
                             rudder_angle=rudder_angle,
@@ -329,6 +157,33 @@ class SailingEnvCSCA(base_env.BaseEnvironment):
                 self.is_done(new_state),
                 info,
                 )
+
+    def polar_speed_curve(self, angle_to_wind, sail_trim):
+        """
+        Simplified polar: max speed depends on apparent wind angle and sail trim.
+        angle_to_wind: radians, 0 = head to wind
+        sail_trim: 0-1, 1 = full power
+        """
+        speed_factor = jnp.where((jnp.abs(angle_to_wind) < jnp.pi / 4),  # close-hauled
+            0.5,
+            jnp.where((jnp.abs(angle_to_wind) < 2 * jnp.pi / 3),  # beam/broad reach
+                1.0,
+                0.7  # running
+            )
+        )
+        return speed_factor * sail_trim * self.hull_speed
+
+    def wind_shadow(self, boat_pos, other_boats):
+        """
+        Reduce apparent wind if another boat is upwind and in line.
+        """
+        reduction = 1.0
+        for other in other_boats:
+            vec = boat_pos - other.boat_pos
+            angle = jnp.arctan2(vec[1], vec[0])
+            diff = jnp.abs(angle - jnp.radians(self.wind_dir))
+            reduction = jnp.where(diff < jnp.radians(10), 0.7, reduction)
+        return reduction
 
     @staticmethod
     def boat_to_global(boat_heading, boat_val):
