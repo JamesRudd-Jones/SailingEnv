@@ -7,16 +7,21 @@ authors = [
 ]
 dependencies = [
                 "matplotlib>=3.10.1",
-                "jax[cuda]>=0.6.0",
+                "jax==0.6.0",
                 "chex>=0.1.89",
                 "distrax>=0.1.5",
+                "optax>=0.2.7",
                 "flax>=0.10.6",
-                "bifurcagym @ git+ssh://git@github.com/JamesRudd-Jones/BifurcaGym.git@main",
                 ]
 
-requires-python = "==3.10.*"
+requires-python = ">=3.11,<3.13"
 readme = "README.md"
 license = {text = "MIT"}
+
+[project.optional-dependencies]
+cuda = [
+    "jax[cuda12]==0.6.0",
+]
 
 [build-system]
 requires = ["pdm-backend"]
@@ -28,14 +33,22 @@ build-backend = "pdm.backend"
  verify_ssl = true
  type = "find_links"
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.pdm]
+distribution = false
+
 [tool.pdm.scripts]
-test.cmd = "pytest -n auto --maxprocesses 8 --dist loadfile"
+test.cmd = "pytest"
 # test.env = { JAX_PLATFORM_NAME = "cpu", JAX_DISABLE_MOST_OPTIMIZATIONS = "1" }
 lint.shell = "ruff . && black --check ."
 fmt.shell = "ruff --fix . && black ."
 
 [tool.pdm.dev-dependencies]
 dev = [
+    "-e file:///${PROJECT_ROOT}/../BifurcaGym#egg=bifurcagym",
     "lxm3>=0.4.0",
     "ruff>=0.1.11",
     "black>=23.12.1",
