@@ -14,6 +14,10 @@ from project_name.sailing.env import EnvParams, EnvState
 
 CLOSE_HAULED = jnp.radians(45.0)
 ANGLE_OF_ATTACK = jnp.radians(15.0)
+# A big course change, such as a tack, gets the helm hard over until near the new course, as in analysis.tack_helm.
+# The proportional controller alone eases the helm through the turn, and the boat stalls head to wind
+HARD_OVER = jnp.radians(45.0)
+HARD_OVER_BEYOND = jnp.radians(15.0)
 
 
 def scripted_action(state: EnvState, params: EnvParams) -> chex.Array:
@@ -27,7 +31,9 @@ def scripted_action(state: EnvState, params: EnvParams) -> chex.Array:
     current_tack = jnp.where(wrap(boat[dynamics.HEADING] - wind_from) >= 0.0, 1.0, -1.0)
     target = jnp.where(jnp.abs(mark_off_wind) < CLOSE_HAULED, wind_from + current_tack * CLOSE_HAULED, mark_bearing)
 
-    rudder = jnp.clip(1.0 * wrap(boat[dynamics.HEADING] - target) + 0.6 * boat[dynamics.R], -0.6, 0.6)
+    error = wrap(boat[dynamics.HEADING] - target)  # positive rudder reduces the maths heading
+    rudder = jnp.where(jnp.abs(error) > HARD_OVER_BEYOND, jnp.sign(error) * HARD_OVER,
+                       jnp.clip(1.0 * error + 0.6 * boat[dynamics.R], -0.6, 0.6))
 
     wind = wind_velocity(state.wind_speed, state.wind_direction)
     apparent_angle = dynamics.forces_and_moment(boat, wind, params.boat)["apparent_wind_angle"]

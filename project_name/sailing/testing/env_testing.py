@@ -54,10 +54,15 @@ def contract_problem(env, env_params, key) -> str:
     return ""
 
 
-def run_scripted(env, env_params, key):
+EVALUATION_KEY = jrandom.key(5)
+EVALUATION_EPISODES = 512
+
+
+def run_episodes(env, env_params, policy, key):
+    """One episode without autoreset, where policy(obs, state) gives the action. The wind depends only on the key."""
     def body(carry, step_key):
         obs, state = carry
-        action = scripted_action(state, env_params)
+        action = policy(obs, state)
         new_obs, _, new_state, reward, done, info = env.step(action, state, env_params, step_key)
         return (new_obs, new_state), (state, reward, done, info["finished"])
 
@@ -65,6 +70,25 @@ def run_scripted(env, env_params, key):
     carry = env.reset(env_params, reset_key)
     _, history = jax.lax.scan(body, carry, jrandom.split(steps_key, env.max_steps_in_ep))
     return history
+
+
+def evaluate(env, env_params, policy) -> dict:
+    """The same EVALUATION_EPISODES episodes for any policy, so that scores can be compared directly."""
+    run = jax.jit(jax.vmap(lambda k: run_episodes(env, env_params, policy, k)))
+    states, rewards, dones, finished = jax.tree.map(np.array, run(jrandom.split(EVALUATION_KEY, EVALUATION_EPISODES)))
+
+    ever_done = dones.any(axis=1)
+    ended = np.where(ever_done, np.argmax(dones, axis=1), env.max_steps_in_ep - 1)
+    success = finished[np.arange(len(ended)), ended] & ever_done
+    returns = np.array([rewards[i, :ended[i] + 1].sum() for i in range(len(ended))])
+    finish_times = (ended[success] + 1) * env.dt
+    return {"states": states, "ended": ended, "success": success, "returns": returns, "finish_times": finish_times,
+            "finish_rate": success.mean(), "median_time": np.median(finish_times) if success.any() else np.inf,
+            "mean_return": returns.mean()}
+
+
+def describe(result: dict) -> str:
+    return f"{result['finish_rate']:.1%} finish, median {result['median_time']:.0f} s, mean return {result['mean_return']:.2f}"
 
 
 def main() -> Checks:
@@ -88,6 +112,14 @@ def main() -> Checks:
 
     obs_space = env.observation_space(params)
     checks.check("Observation bounds are the right way round", jnp.all(obs_space.low < obs_space.high))
+
+    spread_params = params.replace(mark_bearing_spread=180.0)
+    marks = jax.vmap(lambda k: env.reset(spread_params, k)[1].mark)(jrandom.split(jrandom.key(6), 1000))
+    bearings = np.degrees(np.arctan2(marks[:, 0], marks[:, 1]))  # compass, from the start
+    checks.check("Mark bearing spread turns the mark all round, at the same distance",
+                 bearings.min() < -170.0 and bearings.max() > 170.0 and np.allclose(np.hypot(marks[:, 0], marks[:, 1]), 100.0, atol=1e-3),
+                 f"compass bearings {bearings.min():.0f} to {bearings.max():.0f} deg, "
+                 f"{np.mean(np.abs(bearings) < 45.0):.0%} within 45 deg of upwind")
 
     # All the wrappers together, batched and scanned, as the RL pipeline runs them
     wrapped = MetricsWrapper(AutoResetWrapper(NormalisedSailingCSCA(SailingCSCA())))
@@ -122,18 +154,9 @@ def main() -> Checks:
           f"or {rate * env.dt:,.0f} simulated boat seconds per second")
 
     # The tactician
-    states, rewards, dones, finished = jax.jit(jax.vmap(lambda k: run_scripted(env, params, k)))(jrandom.split(jrandom.key(5), 512))
-    states, rewards, dones, finished = jax.tree.map(np.array, (states, rewards, dones, finished))
-
-    first_done = np.argmax(dones, axis=1)
-    ever_done = dones.any(axis=1)
-    ended = np.where(ever_done, first_done, env.max_steps_in_ep - 1)
-    success = finished[np.arange(len(ended)), ended] & ever_done
-    returns = np.array([rewards[i, :ended[i] + 1].sum() for i in range(len(ended))])
-    finish_times = (ended[success] + 1) * env.dt
-
-    checks.check("Scripted tactician reliably reaches the mark upwind", success.mean() > 0.95,
-                 f"{success.mean():.1%} finish, median {np.median(finish_times):.0f} s, mean return {returns.mean():.2f}")
+    result = evaluate(env, params, lambda obs, state: scripted_action(state, params))
+    states, ended, success, finish_times = result["states"], result["ended"], result["success"], result["finish_times"]
+    checks.check("Scripted tactician reliably reaches the mark upwind", result["finish_rate"] > 0.95, describe(result))
 
     made_good = 100.0 / np.median(finish_times)
     checks.check("Its speed to windward agrees with the polars", 0.6 < made_good < 1.6,

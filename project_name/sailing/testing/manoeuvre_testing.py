@@ -33,24 +33,26 @@ def main() -> Checks:
     checks.check("Cannot sail directly into the wind", head_to_wind[-1, dynamics.U] < 0.2,
                  f"2.00 m/s falls to {head_to_wind[-1, dynamics.U]:.2f} m/s in 30 s")
 
-    # Tack
+    # Tack, with the helm hard over and the sheet where it is fastest close-hauled
     start, end = jnp.radians(90.0 - 45.0), jnp.radians(90.0 + 45.0)
-
-    def tack_policy(boat, t):
-        return analysis.heading_hold(jnp.where(t < 60.0, start, end), jnp.radians(20.0))(boat, t)
-
+    tack_policy = analysis.tack_helm(start, end, 60.0, jnp.radians(15.0))
     tack = np.array(analysis.rollout(analysis.start_state(start, u=1.0), tack_policy, wind, params, 100.0))
     time_axis = np.arange(len(tack)) * DT
     before, during = tack[1199], tack[1200:1400]
+    kept = during[:, dynamics.U].min() / before[dynamics.U]
     checks.check("Tack carries way through the wind", during[:, dynamics.U].min() > 0.0,
                  f"{before[dynamics.U]:.2f} falls to {during[:, dynamics.U].min():.2f} m/s, ends {tack[-1, dynamics.U]:.2f} m/s")
+    # Provisional, like the polar targets: a sailor's figure for a Firefly tack should replace it
+    checks.check("Tack keeps at least a quarter of its speed", kept > 0.25, f"keeps {100 * kept:.0f}% at the slowest")
+    settled = np.argmax(np.abs(np.array(wrap(jnp.array(tack[1200:, dynamics.HEADING]) - end))) < np.radians(5.0)) * DT
+    checks.check("Tack is on the new course within 8 s", 0.0 < settled < 8.0, f"within 5 deg after {settled:.1f} s")
     checks.check("Boom crosses by itself in the tack", before[dynamics.BOOM] * tack[-1, dynamics.BOOM] < 0.0,
                  f"{np.degrees(before[dynamics.BOOM]):.0f} to {np.degrees(tack[-1, dynamics.BOOM]):.0f} deg")
     ax_tack.set_title("Speed through a tack and a gybe")
     ax_tack.plot(time_axis - 60.0, tack[:, dynamics.U], color=SERIES[0], label="Tack, 45° each side of the wind")
     ax_tack.set(xlim=(-5, 25), xlabel="Time from the turn starting (s)", ylabel="Forward speed (m/s)")
     ax_gybe.set_title("Boom through a tack and a gybe")
-    ax_gybe.plot(time_axis - 60.0, np.degrees(tack[:, dynamics.BOOM]), color=SERIES[0], label="Tack, sheet 20°")
+    ax_gybe.plot(time_axis - 60.0, np.degrees(tack[:, dynamics.BOOM]), color=SERIES[0], label="Tack, sheet 15°, helm 45°")
     ax_gybe.set(xlim=(-5, 25), xlabel="Time from the turn starting (s)", ylabel="Boom angle (deg), positive to starboard")
 
     # Gybe

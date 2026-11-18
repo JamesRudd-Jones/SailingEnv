@@ -13,6 +13,7 @@ from project_name.sailing.testing import (angle_testing,
                                           polar_testing,
                                           rigid_body_testing,
                                           stability_testing,
+                                          tack_testing,
                                           )
 
 
@@ -23,6 +24,7 @@ if __name__ == "__main__":
                                              stability_testing,
                                              polar_testing,
                                              manoeuvre_testing,
+                                             tack_testing,
                                              env_testing)]
 
     print("\n=== Summary ===")

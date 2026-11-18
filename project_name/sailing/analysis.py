@@ -73,6 +73,27 @@ def heading_hold(target_heading: chex.Array, sail_command: chex.Array) -> Callab
     return policy
 
 
+def tack_helm(start_heading: chex.Array, end_heading: chex.Array, turn_time: float, sail_command: chex.Array,
+              helm: float = 0.79, straighten: float = 0.26) -> Callable:
+    """
+    Holds start_heading until turn_time, then puts the helm hard over towards end_heading, as a sailor tacking or
+    gybing would, and hands back to heading_hold once within straighten (rad) of the new course.
+
+    heading_hold alone eases the helm in proportion to what is left of the turn, so the boat stalls head to wind. The
+    default 45 degrees turns fastest for the least speed lost: 35 turns more slowly, 60 brakes harder.
+    """
+    direction = jnp.sign(wrap(start_heading - end_heading))  # positive rudder reduces the maths heading
+    hold_start, hold_end = heading_hold(start_heading, sail_command), heading_hold(end_heading, sail_command)
+
+    def policy(boat, t):
+        # Only while the new course is still ahead, so an overshoot is corrected rather than made worse
+        turning = (t >= turn_time) & (direction * wrap(boat[dynamics.HEADING] - end_heading) > straighten)
+        held = jnp.where(t < turn_time, hold_start(boat, t), hold_end(boat, t))
+        return jnp.where(turning, jnp.stack((direction * helm, sail_command)), held)
+
+    return policy
+
+
 def steady_performance(true_wind_angle_deg: float, wind_speed: float, sheet_rad: chex.Array, params: BoatParams,
                        duration: float = 90.0) -> chex.Array:
     """Mean (u, v) over the last 15 s on a held heading. Wind is from compass north, so heading is taken off that."""

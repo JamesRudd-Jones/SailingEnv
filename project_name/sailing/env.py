@@ -43,6 +43,9 @@ class EnvParams:
 
     mark_east: float = 0.0  # m
     mark_north: float = 100.0  # m, directly upwind of the start, so tacking is needed
+    # Degrees. Each reset turns the mark about the start by up to this either way, so that training sees marks that need
+    # no tacking as well as upwind ones. get_state assumes the unturned mark, so generative_step is exact only at zero
+    mark_bearing_spread: float = 0.0
     mark_radius: float = 5.0  # m
     start_spread: float = 15.0  # m
     arena_half_width: float = 200.0  # m, leaving this ends the episode
@@ -125,6 +128,10 @@ class SailingCSDA(base_env.BaseEnvironment):
 
     def reset_env(self, params: EnvParams, key: chex.PRNGKey) -> Tuple[chex.Array, EnvState]:
         position_key, heading_key, speed_key, wind_speed_key, wind_direction_key = jrandom.split(key, 5)
+        # Folded from the heading key, so that the other draws, and every existing episode, are unchanged at zero spread
+        turn = jnp.radians(params.mark_bearing_spread) * jrandom.uniform(jrandom.fold_in(heading_key, 1), minval=-1.0, maxval=1.0)
+        mark = jnp.array((jnp.cos(turn) * params.mark_east - jnp.sin(turn) * params.mark_north,
+                          jnp.sin(turn) * params.mark_east + jnp.cos(turn) * params.mark_north))
 
         position = jrandom.uniform(position_key, (2,), minval=-params.start_spread, maxval=params.start_spread)
         heading = jrandom.uniform(heading_key, minval=-jnp.pi, maxval=jnp.pi)
@@ -134,7 +141,7 @@ class SailingCSDA(base_env.BaseEnvironment):
         state = EnvState(boat=boat,
                          wind_speed=jnp.maximum(params.mean_wind_speed + params.wind_speed_sd * jrandom.normal(wind_speed_key), 0.5),
                          wind_direction=params.mean_wind_direction + params.wind_direction_sd * jrandom.normal(wind_direction_key),
-                         mark=jnp.array((params.mark_east, params.mark_north)),
+                         mark=mark,
                          time=0)
 
         return self.get_obs(state), state

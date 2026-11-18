@@ -84,8 +84,9 @@ class BoatParams:
     hull_wave_saturation: float = 10.0
     hull_reverse_factor: float = 4.0  # assumed, extra surge drag going astern, from the transom
     hull_sway_coeff: float = 450.0  # N per (m/s)^2, 0.5 * rho * 0.9 m^2 hull lateral area * CD 1
-    yaw_linear_damping: float = 80.0  # N m per rad/s, assumed
-    yaw_quadratic_damping: float = 160.0  # N m per (rad/s)^2, assumed
+    # Sway drag is spread along the waterline, sourced 3.58 m, with a parabolic depth profile, assumed, deepest
+    # amidships. Each strip sees its own crossflow v + r * x, which gives the hull's yaw damping without a separate term
+    hull_length: float = 3.58  # m
 
 
 def foil_force(flow_x: chex.Array,
@@ -127,15 +128,27 @@ def foil_force(flow_x: chex.Array,
     return dynamic_force * (lift * dir_y + drag * dir_x), dynamic_force * (drag * dir_y - lift * dir_x)
 
 
+HULL_STRIPS = 8
+_STRIP_POSITION = (jnp.arange(HULL_STRIPS) + 0.5) / HULL_STRIPS * 2.0 - 1.0  # strip centres, -1 transom to +1 bow
+_STRIP_WEIGHT = (1.0 - _STRIP_POSITION ** 2) / jnp.sum(1.0 - _STRIP_POSITION ** 2)  # share of lateral area
+
+
 def hull_force(u: chex.Array, v: chex.Array, r: chex.Array, params: BoatParams) -> Tuple[chex.Array, chex.Array, chex.Array]:
-    """Surge force from surge speed and sway force from sway speed, so there is no force jump when u crosses zero."""
+    """
+    Surge force from surge speed, so there is no force jump when u crosses zero.
+
+    Sway force and yaw moment come from crossflow drag on strips along the hull, each seeing v + r * x. With r = 0
+    this is exactly the old point drag on v, and the same strips damp rotation.
+    """
     froude = u / params.hull_speed
     wave = params.hull_wave_coeff * froude ** 3 * jnp.abs(froude) / (1.0 + params.hull_wave_saturation * froude ** 2)
     astern = jax.nn.sigmoid(-u / 0.1)
     surge = -(1.0 + (params.hull_reverse_factor - 1.0) * astern) * (params.hull_viscous_coeff * jnp.abs(u) * u + wave)
-    sway = -params.hull_sway_coeff * jnp.abs(v) * v
-    yaw = -(params.yaw_linear_damping + params.yaw_quadratic_damping * jnp.abs(r)) * r
-    return surge, sway, yaw
+
+    strip_x = 0.5 * params.hull_length * _STRIP_POSITION
+    crossflow = jnp.expand_dims(v, -1) + jnp.expand_dims(r, -1) * strip_x
+    strip_force = -params.hull_sway_coeff * _STRIP_WEIGHT * jnp.abs(crossflow) * crossflow
+    return surge, jnp.sum(strip_force, axis=-1), jnp.sum(strip_force * strip_x, axis=-1)
 
 
 def rigid_body_acceleration(u: chex.Array,
